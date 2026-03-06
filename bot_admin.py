@@ -63,11 +63,39 @@ def get_config_list_keyboard(category: str) -> InlineKeyboardMarkup:
     categories = get_all_configurable_keys()
     keys = categories.get(category, [])
     
+    # 中文标签映射
+    zh_labels = {
+        "cleanup_check_interval": "清理检查间隔",
+        "report_expiry_time": "举报记录过期时间",
+        "deleted_message_cleanup_delay": "删除消息延迟",
+        "max_reports_in_memory": "最多保留举报数",
+        "batch_cleanup_size": "批量清理消息数",
+        "auto_ban_threshold": "自动通知阈值",
+        "ban_duration_24h": "24小时禁言",
+        "ban_duration_week": "1周禁言",
+        "rate_limit_window": "速率限制窗口",
+        "max_reports_per_hour": "每小时最多举报次数",
+        "max_keyword_queries_per_hour": "每小时最多查询次数",
+        "enable_bio_check": "启用简介检查",
+        "enable_display_name_check": "启用显示名检查",
+        "enable_fuzzy_match": "启用模糊匹配",
+        "enable_delete_after_ban": "禁言后删除消息",
+        "delete_warning_timeout": "删除警告延迟",
+        "warning_message_timeout": "警告保留时间",
+        "default_blacklist_duration": "默认黑名单时长",
+        "enable_auto_blacklist": "启用自动黑名单",
+        "log_level": "日志级别",
+        "log_retention_days": "日志保留天数",
+        "max_concurrent_operations": "最多并发操作",
+        "api_call_timeout": "API超时",
+    }
+    
     buttons = []
     for key in keys:
         value = config_manager.get(key)
         display_value = format_config_value(value)
-        button_text = f"{key}: {display_value}"
+        label = zh_labels.get(key, key)
+        button_text = f"{label}: {display_value}"
         buttons.append([
             InlineKeyboardButton(
                 text=button_text,
@@ -75,7 +103,8 @@ def get_config_list_keyboard(category: str) -> InlineKeyboardMarkup:
             )
         ])
     
-    buttons.append([InlineKeyboardButton(text="← 返回配置分类", callback_data="admin:config_main")])
+    buttons.append([InlineKeyboardButton(text="← 返回分类", callback_data="admin:config_main")])
+    buttons.append([InlineKeyboardButton(text="↩️ 返回主菜单", callback_data="admin:main")])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 def get_bool_toggle_keyboard(config_key: str) -> InlineKeyboardMarkup:
