@@ -1040,6 +1040,165 @@ FILL_CHARS = set(r" .,，。！？*\\\~`-_=+[]{}()\"'\\|\n\t\r　")
 
 user_short_msg_history = {}
 
+# ==================== 重复发言检测配置 ====================
+# 2 小时内不能重复发送相同内容 3 次
+REPEAT_WINDOW_SECONDS = 2 * 3600          # 检测时间窗口：2 小时
+REPEAT_MAX_COUNT = 3                      # 窗口内相同内容达到 3 次判定为违规
+REPEAT_BAN_DURATION_SECONDS = 86400       # 第一次重复违规禁言 1 天
+
+# key: (group_id, user_id, normalized_text) -> deque[timestamp]
+repeat_message_history = {}
+# key: (group_id, user_id) -> int（0=未因重复违规，1=已因重复违规被禁言 1 次，2=已因重复违规被永封）
+repeat_violation_level = {}
+
+
+def _normalize_text(text: str) -> str:
+    """统一文本格式用于重复检测"""
+    return " ".join((text or "").strip().split()).lower()
+
+
+def _get_display_name_from_message(message: Message, user_id: int) -> str:
+    """从消息中获取用于展示的用户名"""
+    name = None
+    if message and message.from_user and message.from_user.id == user_id:
+        name = message.from_user.full_name or message.from_user.username
+    if not name:
+        name = f"ID {user_id}"
+    return name
+
+
+async def handle_repeat_message(message: Message) -> bool:
+    """
+    检测用户是否在 2 小时内重复发送相同内容
+    返回 True 表示已经进行了处罚/提醒并且本次消息后续逻辑应中止
+    """
+    if not message.text:
+        return False
+
+    user_id = message.from_user.id
+    group_id = message.chat.id
+    norm_text = _normalize_text(message.text)
+    if not norm_text:
+        return False
+
+    key = (group_id, user_id, norm_text)
+    now = time.time()
+
+    if key not in repeat_message_history:
+        repeat_message_history[key] = deque(maxlen=10)
+    history = repeat_message_history[key]
+
+    # 滚动窗口：仅保留 2 小时内的记录
+    while history and now - history[0] > REPEAT_WINDOW_SECONDS:
+        history.popleft()
+
+    history.append(now)
+    count = len(history)
+
+    # 第 2 次：提醒用户不要重复发言
+    if count == 2:
+        warn_text = (
+            "⚠️ 检测到你在 2 小时内重复发送相同内容（2/3），请停止刷屏。"
+        )
+        try:
+            await message.reply(warn_text)
+        except Exception:
+            pass
+        # 仅提醒，不拦截后续其他违规检测
+        return False
+
+    # 第 3 次及以上：按“第一次重复违规”或“再次重复违规”处理
+    if count >= REPEAT_MAX_COUNT:
+        level_key = (group_id, user_id)
+        current_level = repeat_violation_level.get(level_key, 0)
+        display_name = _get_display_name_from_message(message, user_id)
+
+        # 第一次达到 3/3：禁言 1 天
+        if current_level == 0:
+            until_date = int(now) + REPEAT_BAN_DURATION_SECONDS
+            try:
+                await bot.restrict_chat_member(
+                    chat_id=group_id,
+                    user_id=user_id,
+                    permissions=ChatPermissions(
+                        can_send_messages=False,
+                        can_send_media_messages=False,
+                        can_send_polls=False,
+                        can_send_other_messages=False,
+                        can_add_web_page_previews=False,
+                        can_change_info=False,
+                        can_invite_users=False,
+                        can_pin_messages=False
+                    ),
+                    until_date=until_date
+                )
+            except Exception as e:
+                print(f"重复发言禁言失败: {e}")
+                return False
+
+            repeat_violation_level[level_key] = 1
+
+            try:
+                await message.delete()
+            except Exception:
+                pass
+
+            notice = (
+                f"🚫 用户 {display_name}\n"
+                f"📌 触发原因：在 2 小时内多次重复发送相同内容（{REPEAT_MAX_COUNT}/{REPEAT_MAX_COUNT}）。\n"
+                f"🔒 处理结果：已被本群禁言 1 天。\n"
+                f"⚠️ 疑似刷屏/引流，请谨慎。"
+            )
+            try:
+                await bot.send_message(group_id, notice)
+            except Exception:
+                pass
+
+            return True
+
+        # 解封后再次在 2 小时内重复达到 3/3：永封
+        else:
+            try:
+                await bot.restrict_chat_member(
+                    chat_id=group_id,
+                    user_id=user_id,
+                    permissions=ChatPermissions(
+                        can_send_messages=False,
+                        can_send_media_messages=False,
+                        can_send_polls=False,
+                        can_send_other_messages=False,
+                        can_add_web_page_previews=False,
+                        can_change_info=False,
+                        can_invite_users=False,
+                        can_pin_messages=False
+                    )
+                )
+            except Exception as e:
+                print(f"重复发言永封失败: {e}")
+                return False
+
+            repeat_violation_level[level_key] = 2
+
+            try:
+                await message.delete()
+            except Exception:
+                pass
+
+            notice = (
+                f"🚫 用户 {display_name}\n"
+                f"📌 触发原因：多次在 2 小时内重复发送相同内容，且在被解禁后仍然继续违规。\n"
+                f"🔒 处理结果：已被本群永久禁止发言。\n"
+                f"⚠️ 疑似严重刷屏/引流行为，请群友提高警惕。"
+            )
+            try:
+                await bot.send_message(group_id, notice)
+            except Exception:
+                pass
+
+            return True
+
+    return False
+
 async def load_data():
     global reports
     try:
@@ -1101,7 +1260,11 @@ async def detect_and_warn(message: Message):
     user_id = message.from_user.id
     group_id = message.chat.id
     
-    # 检查举报禁言
+    # 重复发言检测（优先执行）
+    if await handle_repeat_message(message):
+        return
+    
+    # 检查举报禁言（被多人举报的集中处理）
     reported_count = count_user_reported_messages(user_id, group_id)
     threshold = cfg.get("reported_message_threshold", 2)
     
@@ -1112,11 +1275,33 @@ async def detect_and_warn(message: Message):
             await bot.restrict_chat_member(
                 chat_id=group_id,
                 user_id=user_id,
-                permissions=ChatPermissions(can_send_messages=False),
+                permissions=ChatPermissions(
+                    can_send_messages=False,
+                    can_send_media_messages=False,
+                    can_send_polls=False,
+                    can_send_other_messages=False,
+                    can_add_web_page_previews=False,
+                    can_change_info=False,
+                    can_invite_users=False,
+                    can_pin_messages=False
+                ),
                 until_date=until_date
             )
-            notice = f"账户异常（{reported_count}条举报），已禁言{mute_hours}h。异议联系管理员。"
-            await message.reply(notice)
+
+            # 删除当前触发的源消息
+            try:
+                await message.delete()
+            except Exception:
+                pass
+
+            display_name = _get_display_name_from_message(message, user_id)
+            notice = (
+                f"🚫 用户 {display_name}\n"
+                f"📌 触发原因：在本群多次被成员举报（累计 {reported_count} 条）。\n"
+                f"🔒 处理结果：已被限制发言 {mute_hours} 小时。\n"
+                f"⚠️ 疑似引流/广告，请谨慎，可继续使用“举报”按钮。"
+            )
+            await bot.send_message(group_id, notice)
             return
         except Exception as e:
             print(f"禁言失败: {e}")
@@ -1190,7 +1375,13 @@ async def detect_and_warn(message: Message):
     if len(triggers) > 0:
         try:
             reason = "+".join(triggers)
-            warning_text = f"⚠️ ID: {user_id}\n原因: {reason}"
+            display_name = _get_display_name_from_message(message, user_id)
+            warning_text = (
+                "🚨 检测到疑似违规内容\n\n"
+                f"👤 用户：{display_name}（ID: {user_id}）\n"
+                f"📌 触发原因：{reason}\n\n"
+                "⚠️ 疑似引流/广告，请谨慎，可点下方按钮举报或标记误判。"
+            )
             kb = build_warning_buttons(message.message_id, 0)
             warning = await message.reply(warning_text, reply_markup=kb)
             
@@ -1201,7 +1392,9 @@ async def detect_and_warn(message: Message):
                     "chat_id": group_id,
                     "reporters": set(),
                     "reason": reason,
-                    "trigger_count": len(triggers)
+                    "trigger_count": len(triggers),
+                    "suspect_name": display_name,
+                    "original_message_id": message.message_id
                 }
             await save_data()
         except Exception as e:
@@ -1226,7 +1419,13 @@ async def detect_and_warn(message: Message):
                 )
             )
             reason = "+".join(triggers)
-            final_text = f"⚠️ ID: {user_id}\n原因: {reason}\n结果: 已自动封禁。异议联系管理员。"
+            display_name = _get_display_name_from_message(message, user_id)
+            final_text = (
+                f"🚫 用户 {display_name}\n"
+                f"📌 触发原因：{reason}\n"
+                "🔒 处理结果：因同时触发多项高危规则，已被本群永久限制发言。\n"
+                "⚠️ 疑似高危引流/广告内容，请所有群友提高警惕。"
+            )
             try:
                 async with lock:
                     if message.message_id in reports:
@@ -1237,11 +1436,11 @@ async def detect_and_warn(message: Message):
                             text=final_text,
                             reply_markup=None
                         )
-            except:
+            except Exception:
                 pass
             try:
                 await message.delete()
-            except:
+            except Exception:
                 pass
         except Exception as e:
             print(f"自动封禁失败: {e}")
@@ -1288,7 +1487,7 @@ async def handle_admin_ban(callback: CallbackQuery):
                 can_pin_messages=False
             )
         )
-        await callback.answer("✅ 已处理", show_alert=True)
+        await callback.answer("✅ 已处理")
     except Exception as e:
         print(f"管理员封禁失败: {e}")
         await callback.answer("❌ 失败", show_alert=True)
@@ -1302,11 +1501,11 @@ async def handle_report(callback: CallbackQuery):
         
         async with lock:
             if msg_id not in reports:
-                await callback.answer("已过期", show_alert=True)
+                await callback.answer("已过期")
                 return
             data = reports[msg_id]
             if reporter_id in data["reporters"]:
-                await callback.answer("已举报过", show_alert=True)
+                await callback.answer("已举报过")
                 return
             data["reporters"].add(reporter_id)
             count = len(data["reporters"])
@@ -1323,7 +1522,14 @@ async def handle_report(callback: CallbackQuery):
         await save_user_violations()
         
         # 修改警告消息 - 关键：显示举报数 + 根据举报数决定按钮
-        updated_text = f"⚠️ ID: {user_id}\n原因: {reason}\n举报: {count}人"
+        display_name = data.get("suspect_name") or f"ID {user_id}"
+        updated_text = (
+            "🚨 已收到群成员的举报\n\n"
+            f"👤 用户：{display_name}（ID: {user_id}）\n"
+            f"📌 触发原因：{reason}\n"
+            f"📣 当前举报人数：{count} 人\n\n"
+            "⚠️ 疑似引流/广告消息，请谨慎，可继续补充举报，由管理员统一处理。"
+        )
         kb = build_warning_buttons(msg_id, count)  # count > 0 时会添加封禁按钮
         
         try:
@@ -1336,7 +1542,7 @@ async def handle_report(callback: CallbackQuery):
         except:
             pass
         
-        await callback.answer(f"✅ 举报({count}人)", show_alert=True)
+        await callback.answer(f"✅ 举报({count}人)")
         await save_data()
     except Exception as e:
         print("举报异常:", e)
@@ -1352,7 +1558,7 @@ async def handle_ban(callback: CallbackQuery):
         
         async with lock:
             if msg_id not in reports:
-                await callback.answer("已过期", show_alert=True)
+                await callback.answer("已过期")
                 return
             data = reports[msg_id]
             user_id = data["suspect_id"]
@@ -1382,10 +1588,22 @@ async def handle_ban(callback: CallbackQuery):
             until_date=until_date
         )
         
-        # 修改警告消息为最终状态
-        ban_type = "禁24h" if action == "ban24h" else "永封"
+        # 删除被封禁用户的源消息（避免继续在群内展示）
+        try:
+            await bot.delete_message(group_id, msg_id)
+        except Exception:
+            pass
+
+        # 修改警告消息为最终状态并给出完整说明
+        ban_type = "禁言 24 小时" if action == "ban24h" else "永久禁止在本群发言"
         report_count = len(data.get("reporters", set()))
-        final_text = f"⚠️ ID: {user_id}\n原因: {reason}\n举报: {report_count}人\n结果: {ban_type}"
+        display_name = data.get("suspect_name") or f"ID {user_id}"
+        final_text = (
+            f"🚫 用户 {display_name}\n"
+            f"📌 触发原因：{reason}（已被 {report_count} 位成员举报）\n"
+            f"🔒 处理结果：{ban_type}。\n"
+            "⚠️ 疑似引流/广告账号，请谨慎，不要随意添加或私信。"
+        )
         
         try:
             await bot.edit_message_text(
@@ -1397,17 +1615,7 @@ async def handle_ban(callback: CallbackQuery):
         except:
             pass
         
-        # 延迟删除警告消息
-        async def delayed_delete():
-            await asyncio.sleep(10)
-            try:
-                await bot.delete_message(group_id, warning_id)
-            except:
-                pass
-        
-        asyncio.create_task(delayed_delete())
-        
-        await callback.answer(f"✅ {ban_type}", show_alert=True)
+        await callback.answer(f"✅ {ban_type}")
         
         async with lock:
             reports.pop(msg_id, None)
@@ -1428,7 +1636,7 @@ async def handle_exempt(callback: CallbackQuery):
         
         async with lock:
             if msg_id not in reports:
-                await callback.answer("已过期", show_alert=True)
+                await callback.answer("已过期")
                 return
             data = reports[msg_id]
             group_id = data["chat_id"]
@@ -1444,7 +1652,7 @@ async def handle_exempt(callback: CallbackQuery):
         except:
             pass
         
-        await callback.answer("✅ 已豁免", show_alert=True)
+        await callback.answer("✅ 已豁免")
         
         async with lock:
             reports.pop(msg_id, None)
