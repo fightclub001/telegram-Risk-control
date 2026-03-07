@@ -14,7 +14,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 
-# ==================== 配置 ====================
+# ==================== 环境配置 ====================
 GROUP_IDS = set()
 ADMIN_IDS = set()
 
@@ -49,15 +49,14 @@ USER_VIOLATIONS_FILE = "/data/user_violations.json"
 reports = {}
 lock = asyncio.Lock()
 user_violations = {}
+config = {}
 
 # ==================== 全局配置结构 ====================
 DEFAULT_CONFIG = {
     "groups": {}
 }
 
-config = DEFAULT_CONFIG.copy()
-
-# ==================== 配置管理 ====================
+# ==================== 配置管理函数 ====================
 async def load_config():
     global config
     try:
@@ -95,6 +94,7 @@ async def save_user_violations():
         print(f"保存违规记录失败: {e}")
 
 def get_group_config(group_id: int):
+    """获取群组配置，不存在则创建默认配置"""
     gid = str(group_id)
     if gid not in config["groups"]:
         config["groups"][gid] = {
@@ -150,7 +150,7 @@ class AdminStates(StatesGroup):
     EditMuteHours = State()
     EditReportedThreshold = State()
 
-# ==================== UI 键盘 ====================
+# ==================== UI 键盘函数 ====================
 def get_main_menu_keyboard():
     buttons = [
         [InlineKeyboardButton(text="⚙️ 群组管理", callback_data="choose_group")],
@@ -379,7 +379,7 @@ async def edit_bio_keywords(callback: CallbackQuery, state: FSMContext):
         kw_text = "\n".join(keywords)
         text = f"📝 编辑简介敏感词\n\n当前词汇：\n{kw_text}\n\n请发送新的关键词列表（一行一个），或发送 /clear 清空："
         await callback.message.edit_text(text, reply_markup=None)
-        await state.update_data(group_id=group_id, current_menu="bio_kw")
+        await state.update_data(group_id=group_id)
         await state.set_state(AdminStates.EditBioKeywords)
         await callback.answer()
     except Exception as e:
@@ -617,7 +617,7 @@ async def edit_threshold(callback: CallbackQuery, state: FSMContext):
         current = cfg.get("short_msg_threshold", 3)
         text = f"输入新的字数阈值（当前: {current}）："
         await callback.message.edit_text(text, reply_markup=None)
-        await state.update_data(group_id=group_id, edit_field="short_msg_threshold")
+        await state.update_data(group_id=group_id)
         await state.set_state(AdminStates.EditShortMsgThreshold)
         await callback.answer()
     except Exception as e:
@@ -648,7 +648,7 @@ async def edit_consecutive(callback: CallbackQuery, state: FSMContext):
         current = cfg.get("min_consecutive_count", 2)
         text = f"输入新的连续条数（当前: {current}）："
         await callback.message.edit_text(text, reply_markup=None)
-        await state.update_data(group_id=group_id, edit_field="min_consecutive_count")
+        await state.update_data(group_id=group_id)
         await state.set_state(AdminStates.EditConsecutiveCount)
         await callback.answer()
     except Exception as e:
@@ -679,7 +679,7 @@ async def edit_window(callback: CallbackQuery, state: FSMContext):
         current = cfg.get("time_window_seconds", 60)
         text = f"输入新的时间窗口（秒，当前: {current}）："
         await callback.message.edit_text(text, reply_markup=None)
-        await state.update_data(group_id=group_id, edit_field="time_window_seconds")
+        await state.update_data(group_id=group_id)
         await state.set_state(AdminStates.EditTimeWindow)
         await callback.answer()
     except Exception as e:
@@ -1051,7 +1051,7 @@ async def view_status(callback: CallbackQuery):
     except Exception as e:
         await callback.answer(f"❌ 错误: {str(e)}", show_alert=True)
 
-# ==================== 群内检测逻辑 ====================
+# ==================== 群内检测和回复逻辑 ====================
 FILL_CHARS = set(r" .,，。！？*\\\~`-_=+[]{}()\"'\\|\n\t\r　")
 
 user_short_msg_history = {}
@@ -1080,14 +1080,34 @@ async def save_data():
             print("保存失败:", e)
 
 def count_user_reported_messages(user_id: int, group_id: int) -> int:
+    """统计用户在群组中被举报的消息数"""
     key = f"{group_id}_{user_id}"
     user_vio = user_violations.get(key, {})
     reported_count = sum(1 for v in user_vio.values() if v.get("reported"))
     return reported_count
 
+def build_warning_keyboard(msg_id: int, report_count: int):
+    """构建警告消息的按钮 - 初始状态只有举报和误判"""
+    buttons = []
+    if report_count == 0:
+        buttons.append([
+            InlineKeyboardButton(text="举报该用户", callback_data=f"report:{msg_id}"),
+            InlineKeyboardButton(text="误判/豁免👮‍♂️", callback_data=f"exempt:{msg_id}")
+        ])
+    else:
+        buttons.append([
+            InlineKeyboardButton(text="举报该用户", callback_data=f"report:{msg_id}"),
+            InlineKeyboardButton(text="误判/豁免👮‍♂️", callback_data=f"exempt:{msg_id}")
+        ])
+        buttons.append([
+            InlineKeyboardButton(text="封禁24小时👮‍♂️", callback_data=f"ban24h:{msg_id}"),
+            InlineKeyboardButton(text="永久封禁👮‍♂️", callback_data=f"banperm:{msg_id}")
+        ])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
 @router.message(F.chat.id.in_(GROUP_IDS), F.text)
-async def detect_violations(message: Message):
-    """5层统一检测逻辑（发言时）"""
+async def detect_and_warn(message: Message):
+    """发言时检测，触发时发送警告（无论触发几层）"""
     if not message.from_user or message.from_user.is_bot:
         return
     
@@ -1098,7 +1118,7 @@ async def detect_violations(message: Message):
     user_id = message.from_user.id
     group_id = message.chat.id
     
-    # 检查举报禁言
+    # 第一步：检查举报禁言
     reported_count = count_user_reported_messages(user_id, group_id)
     threshold = cfg.get("reported_message_threshold", 2)
     
@@ -1118,7 +1138,7 @@ async def detect_violations(message: Message):
         except Exception as e:
             print(f"禁言失败: {e}")
     
-    # 统计5层触发
+    # 第二步：统计5层触发
     triggers = []
     
     # 1. 简介链接检测
@@ -1127,7 +1147,7 @@ async def detect_violations(message: Message):
             chat_info = await bot.get_chat(user_id)
             bio = (chat_info.bio or "").lower()
             if any(x in bio for x in ["http://", "https://", "t.me/", "@"]):
-                triggers.append("简介链接")
+                triggers.append("简介含链接")
     except Exception:
         pass
     
@@ -1137,7 +1157,7 @@ async def detect_violations(message: Message):
             chat_info = await bot.get_chat(user_id)
             bio = (chat_info.bio or "").lower()
             if any(kw.lower() in bio for kw in cfg.get("bio_keywords", [])):
-                triggers.append("简介敏感词")
+                triggers.append("简介含敏感词")
     except Exception:
         pass
     
@@ -1145,7 +1165,7 @@ async def detect_violations(message: Message):
     if cfg.get("check_display_keywords", True):
         display_name = (message.from_user.full_name or "").lower()
         if any(kw.lower() in display_name for kw in cfg.get("display_keywords", [])):
-            triggers.append("名称敏感词")
+            triggers.append("名称含敏感词")
     
     # 4. 消息敏感词检测
     if cfg.get("check_message_keywords", True):
@@ -1171,7 +1191,7 @@ async def detect_violations(message: Message):
             recent = list(history)[-cfg.get("min_consecutive_count", 2):]
             if len(recent) >= cfg.get("min_consecutive_count", 2):
                 if all(len(t.strip()) <= cfg.get("short_msg_threshold", 3) for _, t in recent):
-                    triggers.append("连续极短")
+                    triggers.append("连续极短消息")
     
     # 6. 填充垃圾检测
     if cfg.get("fill_garbage_detection", True):
@@ -1183,11 +1203,32 @@ async def detect_violations(message: Message):
             if (clean_len <= cfg.get("fill_garbage_max_clean_len", 8)) or (space_ratio >= cfg.get("fill_space_ratio", 0.30)):
                 triggers.append("垃圾填充")
     
-    # 三层处理逻辑
-    if len(triggers) >= 3:
-        # 3个及以上 → 自动直接封禁所有权限
+    # 第四步：如果有触发，发送警告回复（无论几层）
+    if len(triggers) > 0:
         try:
             reason = "+".join(triggers)
+            warning_text = f"ID: {user_id}\n原因: {reason}"
+            kb = build_warning_keyboard(message.message_id, 0)
+            warning = await message.reply(warning_text, reply_markup=kb)
+            
+            async with lock:
+                reports[message.message_id] = {
+                    "warning_id": warning.message_id,
+                    "suspect_id": user_id,
+                    "chat_id": group_id,
+                    "reporters": set(),
+                    "original_text": warning_text,
+                    "original_message_id": message.message_id,
+                    "trigger_count": len(triggers)
+                }
+            await save_data()
+        except Exception as e:
+            print(f"发送警告失败: {e}")
+    
+    # 第五步：根据触发层数进行不同处理
+    if len(triggers) >= 3:
+        # 3层及以上：自动直接封禁全部权限
+        try:
             await bot.restrict_chat_member(
                 chat_id=group_id,
                 user_id=user_id,
@@ -1202,55 +1243,53 @@ async def detect_violations(message: Message):
                     can_pin_messages=False
                 )
             )
-            notice = f"检测到多项违规({reason})，已被自动封禁。有异议联系管理员。"
-            await message.reply(notice)
+            # 修改警告消息，添加处罚结果
+            reason = "+".join(triggers)
+            final_text = f"ID: {user_id}\n原因: {reason}\n处罚: 已被系统自动封禁。误封联系管理员。"
+            try:
+                async with lock:
+                    if message.message_id in reports:
+                        warning_id = reports[message.message_id]["warning_id"]
+                        await bot.edit_message_text(
+                            chat_id=group_id,
+                            message_id=warning_id,
+                            text=final_text,
+                            reply_markup=None
+                        )
+            except:
+                pass
+            # 删除用户的原始消息
+            try:
+                await message.delete()
+            except:
+                pass
         except Exception as e:
             print(f"自动封禁失败: {e}")
     
     elif len(triggers) == 2:
-        # 2个 → 通知管理员处理
+        # 2层：通知管理员（私信）
         try:
             reason = "+".join(triggers)
-            admin_msg = f"⚠️ ID {user_id} 触发多项检测\n\n触发: {reason}\n内容: {message.text[:80]}\n\n请处理"
-            keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            admin_msg = f"⚠️ 用户 {user_id} 触发多项检测\n\n触发条件: {reason}\n消息内容: {message.text[:80]}\n\n请确认处理"
+            kb = InlineKeyboardMarkup(inline_keyboard=[
                 [InlineKeyboardButton(text="🚫 立即封禁", callback_data=f"admin_ban_user:{group_id}:{user_id}:{message.message_id}")]
             ])
-            
             for admin_id in ADMIN_IDS:
                 try:
-                    await bot.send_message(admin_id, admin_msg, reply_markup=keyboard)
+                    await bot.send_message(admin_id, admin_msg, reply_markup=kb)
                 except:
                     pass
         except Exception as e:
             print(f"通知管理员失败: {e}")
-    
-    elif len(triggers) == 1:
-        # 1个 → 简洁警告
-        try:
-            reason = triggers[0]
-            warning_text = f"ID: {user_id}\n原因: {reason}"
-            warning = await message.reply(warning_text)
-            
-            async with lock:
-                reports[message.message_id] = {
-                    "warning_id": warning.message_id,
-                    "suspect_id": user_id,
-                    "chat_id": group_id,
-                    "reporters": set(),
-                    "original_text": warning_text,
-                    "original_message_id": message.message_id
-                }
-            await save_data()
-        except Exception as e:
-            print(f"发送警告失败: {e}")
 
 @router.callback_query(F.data.startswith("admin_ban_user:"))
-async def handle_admin_ban_user(callback: CallbackQuery):
-    """管理员点击封禁"""
+async def handle_admin_ban(callback: CallbackQuery):
+    """管理员一键封禁"""
     try:
         parts = callback.data.split(":")
         group_id = int(parts[1])
         user_id = int(parts[2])
+        msg_id = int(parts[3])
         
         if callback.from_user.id not in ADMIN_IDS:
             await callback.answer("仅管理员可操作", show_alert=True)
@@ -1271,54 +1310,59 @@ async def handle_admin_ban_user(callback: CallbackQuery):
             )
         )
         
-        await callback.answer("✅ 已封禁", show_alert=True)
+        await callback.answer("✅ 已封禁此用户", show_alert=True)
     except Exception as e:
         print(f"管理员封禁失败: {e}")
-        await callback.answer("❌ 失败", show_alert=True)
 
 @router.callback_query(F.data.startswith("report:"))
 async def handle_report(callback: CallbackQuery):
+    """用户举报触发后，修改消息显示举报按钮和封禁按钮"""
     try:
-        original_id = int(callback.data.split(":", 1)[1])
+        msg_id = int(callback.data.split(":", 1)[1])
         reporter_id = callback.from_user.id
         
         async with lock:
-            if original_id not in reports:
+            if msg_id not in reports:
                 await callback.answer("已过期", show_alert=True)
                 return
-            data = reports[original_id]
+            data = reports[msg_id]
             if reporter_id in data["reporters"]:
                 await callback.answer("已举报过", show_alert=True)
                 return
             data["reporters"].add(reporter_id)
             count = len(data["reporters"])
-            suspect_id = data["suspect_id"]
+            user_id = data["suspect_id"]
+            group_id = data["chat_id"]
             warning_id = data["warning_id"]
-            chat_id = data["chat_id"]
-            original_text = data.get("original_text", "")
+            reason = data["original_text"].split("\n")[1] if "\n" in data["original_text"] else "未知"
         
         # 更新违规记录
-        key = f"{chat_id}_{suspect_id}"
+        key = f"{group_id}_{user_id}"
         if key not in user_violations:
             user_violations[key] = {}
-        user_violations[key][str(original_id)] = {"reported": True, "time": time.time()}
+        user_violations[key][str(msg_id)] = {"reported": True, "time": time.time()}
         await save_user_violations()
         
-        # 编辑机器人消息
-        lines = original_text.split("\n")
-        new_text = f"{lines[0]}\n{lines[1] if len(lines) > 1 else ''}\n举报: {count}人"
+        # 修改警告消息，添加举报数和封禁按钮
+        updated_text = f"ID: {user_id}\n原因: {reason.replace('原因: ', '')}\n举报: {count}人"
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [
+                InlineKeyboardButton(text="封禁24小时👮‍♂️", callback_data=f"ban24h:{msg_id}"),
+                InlineKeyboardButton(text="永久封禁👮‍♂️", callback_data=f"banperm:{msg_id}")
+            ]
+        ])
         
         try:
             await bot.edit_message_text(
-                chat_id=chat_id,
+                chat_id=group_id,
                 message_id=warning_id,
-                text=new_text,
-                reply_markup=None
+                text=updated_text,
+                reply_markup=kb
             )
         except:
             pass
         
-        await callback.answer(f"✅ 举报成功({count}人)", show_alert=True)
+        await callback.answer(f"✅ 举报成功（{count}人）", show_alert=True)
         await save_data()
     except Exception as e:
         print("举报异常:", e)
@@ -1326,29 +1370,31 @@ async def handle_report(callback: CallbackQuery):
 
 @router.callback_query(F.data.startswith(("ban24h:", "banperm:")))
 async def handle_ban(callback: CallbackQuery):
+    """管理员或用户点击封禁按钮"""
     try:
-        action, original_id_str = callback.data.split(":", 1)
-        original_id = int(original_id_str)
+        action, msg_id_str = callback.data.split(":", 1)
+        msg_id = int(msg_id_str)
         caller_id = callback.from_user.id
-        chat_id = callback.message.chat.id
+        
+        async with lock:
+            if msg_id not in reports:
+                await callback.answer("已过期", show_alert=True)
+                return
+            data = reports[msg_id]
+            user_id = data["suspect_id"]
+            group_id = data["chat_id"]
+            warning_id = data["warning_id"]
+            reason_text = data["original_text"]
         
         if caller_id not in ADMIN_IDS:
             await callback.answer("仅管理员可操作", show_alert=True)
             return
         
-        async with lock:
-            if original_id not in reports:
-                await callback.answer("已过期", show_alert=True)
-                return
-            data = reports[original_id]
-            suspect_id = data["suspect_id"]
-            warning_id = data["warning_id"]
-            original_text = data.get("original_text", "")
-        
+        # 执行封禁
         until_date = int(time.time()) + 86400 if action == "ban24h" else None
         await bot.restrict_chat_member(
-            chat_id=chat_id,
-            user_id=suspect_id,
+            chat_id=group_id,
+            user_id=user_id,
             permissions=ChatPermissions(
                 can_send_messages=False,
                 can_send_media_messages=False,
@@ -1362,34 +1408,37 @@ async def handle_ban(callback: CallbackQuery):
             until_date=until_date
         )
         
+        # 修改警告消息
         ban_type = "24h禁言" if action == "ban24h" else "永封"
-        lines = original_text.split("\n")
-        id_part = lines[0] if lines else "ID"
-        reason_part = lines[1] if len(lines) > 1 else "违规"
+        lines = reason_text.split("\n")
+        reason = lines[1].replace("原因: ", "") if len(lines) > 1 else "未知"
         report_count = len(data.get("reporters", set()))
+        final_text = f"ID: {user_id}\n原因: {reason}\n举报: {report_count}人\n已{ban_type}"
         
-        new_text = f"{id_part}\n{reason_part}\n举报: {report_count}\n已{ban_type}"
+        try:
+            await bot.edit_message_text(
+                chat_id=group_id,
+                message_id=warning_id,
+                text=final_text,
+                reply_markup=None
+            )
+        except:
+            pass
         
-        await bot.edit_message_text(
-            chat_id=chat_id,
-            message_id=warning_id,
-            text=new_text,
-            reply_markup=None
-        )
-        
-        await callback.answer(f"✅ 已{ban_type}", show_alert=True)
-        
+        # 删除10秒后删除警告消息
         async def delayed_delete():
             await asyncio.sleep(10)
             try:
-                await bot.delete_message(chat_id, warning_id)
+                await bot.delete_message(group_id, warning_id)
             except:
                 pass
         
         asyncio.create_task(delayed_delete())
         
+        await callback.answer(f"✅ 已{ban_type}", show_alert=True)
+        
         async with lock:
-            reports.pop(original_id, None)
+            reports.pop(msg_id, None)
         await save_data()
     
     except TelegramBadRequest as e:
@@ -1400,41 +1449,36 @@ async def handle_ban(callback: CallbackQuery):
 
 @router.callback_query(F.data.startswith("exempt:"))
 async def handle_exempt(callback: CallbackQuery):
+    """豁免用户"""
     try:
-        original_id = int(callback.data.split(":", 1)[1])
+        msg_id = int(callback.data.split(":", 1)[1])
         caller_id = callback.from_user.id
-        chat_id = callback.message.chat.id
+        
+        async with lock:
+            if msg_id not in reports:
+                await callback.answer("已过期", show_alert=True)
+                return
+            data = reports[msg_id]
+            user_id = data["suspect_id"]
+            group_id = data["chat_id"]
+            warning_id = data["warning_id"]
         
         if caller_id not in ADMIN_IDS:
             await callback.answer("仅管理员可操作", show_alert=True)
             return
         
-        async with lock:
-            if original_id not in reports:
-                await callback.answer("已过期", show_alert=True)
-                return
-            data = reports[original_id]
-            suspect_id = data["suspect_id"]
-            warning_id = data["warning_id"]
-        
-        suspect_user = await bot.get_chat(suspect_id)
-        bio = (suspect_user.bio or "")
-        full_name = f"{suspect_user.first_name or ''} {suspect_user.last_name or ''}".strip()
-        username = suspect_user.username
-        profile_hash = hashlib.sha256(f"{bio}|{full_name}|{username or ''}".encode('utf-8')).hexdigest()
-        
-        async with lock:
-            exempt_users[suspect_id] = profile_hash
-            await bot.delete_message(chat_id, warning_id)
+        # 删除警告消息
+        try:
+            await bot.delete_message(group_id, warning_id)
+        except:
+            pass
         
         await callback.answer("✅ 已豁免", show_alert=True)
         
         async with lock:
-            reports.pop(original_id, None)
+            reports.pop(msg_id, None)
         await save_data()
     
-    except TelegramBadRequest:
-        await callback.answer("失败", show_alert=True)
     except Exception as e:
         print("豁免异常:", e)
         await callback.answer("失败", show_alert=True)
@@ -1445,19 +1489,19 @@ async def cleanup_deleted_messages():
         to_remove = []
         async with lock:
             check_list = list(reports.items())
-        for orig_id, data in check_list:
+        for msg_id, data in check_list:
             try:
                 test_msg = await bot.forward_message(
                     chat_id=list(ADMIN_IDS)[0],
                     from_chat_id=data["chat_id"],
-                    message_id=orig_id
+                    message_id=msg_id
                 )
                 await bot.delete_message(list(ADMIN_IDS)[0], test_msg.message_id)
             except TelegramBadRequest as e:
                 if "not found" in str(e).lower() or "message to forward not found" in str(e).lower():
                     try:
                         await bot.delete_message(data["chat_id"], data["warning_id"])
-                        to_remove.append(orig_id)
+                        to_remove.append(msg_id)
                     except Exception:
                         pass
         if to_remove:
