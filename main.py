@@ -72,6 +72,9 @@ media_report_day_count = {}  # (uid, date_str) -> count
 # 召唤代发：未解锁用户发「召唤」后下一次媒体由机器人代发（避免炸群）
 summon_pending = {}  # (group_id, user_id) -> timestamp
 SUMMON_TIMEOUT_SEC = 300
+# 无权限发媒体警告：同用户删上一条；(group_id, user_id) -> 上一条机器人警告 message_id
+last_media_no_perm_msg = {}
+MEDIA_NO_PERM_DELETE_AFTER_SEC = 60  # 不同用户的警告 1 分钟后自动删除
 # 举报按钮规则：管理员未点击封禁/误判豁免前，按钮永不过期（不因原消息被删而移除）。
 # (1) 机器人自动封禁 (2) 管理员点击封禁：移除按钮并保留/更新文案；(3) 管理员点击误判豁免：删除警告消息。
 # 超过此时长仍未处理：仅隐藏按钮、保留消息文本，并从内存移除记录。
@@ -2237,12 +2240,30 @@ async def on_media_message(message: Message):
             count = media_stats["message_counts"].get(key, 0)
             boosts = media_stats["boosts"].get(key, 0)
             name = _get_display_name_from_message(message, user_id)
-            await bot.send_message(
+            sk = (group_id, user_id)
+            prev_msg_id = last_media_no_perm_msg.get(sk)
+            if prev_msg_id is not None:
+                try:
+                    await bot.delete_message(group_id, prev_msg_id)
+                except Exception:
+                    pass
+            sent = await bot.send_message(
                 group_id,
                 f"⚠️ {name} 尚未解锁发媒体。\n"
                 f"📊 您的进度：发送合规消息 {count}/{need_msg}，助力 {boosts}/{need_boosts}（满其一即可解锁）。\n"
                 f"未解锁输入「召唤」机器人代发；输入「权限」查进度。"
             )
+            last_media_no_perm_msg[sk] = sent.message_id
+            if prev_msg_id is None:
+                async def _delete_after():
+                    await asyncio.sleep(MEDIA_NO_PERM_DELETE_AFTER_SEC)
+                    try:
+                        await bot.delete_message(group_id, sent.message_id)
+                    except Exception:
+                        pass
+                    if last_media_no_perm_msg.get(sk) == sent.message_id:
+                        last_media_no_perm_msg.pop(sk, None)
+                asyncio.create_task(_delete_after())
         return
     reply = await message.reply("📎 媒体消息", reply_markup=_media_reply_buttons(group_id, message.message_id, 0, 0))
     async with media_reports_lock:
@@ -2438,6 +2459,16 @@ async def detect_and_warn(message: Message):
             if (clean_len <= cfg.get("fill_garbage_max_clean_len", 8)) or (space_ratio >= cfg.get("fill_space_ratio", 0.30)):
                 triggers.append("垃圾填充")
     
+    # 消息链接/@引流：直接删消息并简短回复「违规引流」（保持群内整洁）
+    if "消息链接/@引流" in triggers:
+        try:
+            await message.delete()
+        except Exception:
+            pass
+        await message.reply("违规引流")
+        if triggers == ["消息链接/@引流"]:
+            return
+    
     # 第四步：有触发时发送警告（无论几层）
     if len(triggers) > 0:
         try:
@@ -2504,6 +2535,10 @@ async def detect_and_warn(message: Message):
                             text=final_text,
                             reply_markup=None
                         )
+                        try:
+                            await bot.delete_message(chat_id=group_id, message_id=warning_id)
+                        except Exception:
+                            pass
             except Exception:
                 pass
             try:
@@ -2613,6 +2648,48 @@ async def handle_report(callback: CallbackQuery):
             )
         except:
             pass
+        
+        # 2 层触发且被 2 人及以上举报 → 立即永久封禁
+        trigger_count = data.get("trigger_count", 0)
+        if count >= 2 and trigger_count == 2:
+            try:
+                await bot.restrict_chat_member(
+                    chat_id=group_id,
+                    user_id=user_id,
+                    permissions=ChatPermissions(
+                        can_send_messages=False,
+                        can_send_media_messages=False,
+                        can_send_polls=False,
+                        can_send_other_messages=False,
+                        can_add_web_page_previews=False,
+                        can_change_info=False,
+                        can_invite_users=False,
+                        can_pin_messages=False
+                    ),
+                    until_date=None
+                )
+                try:
+                    await bot.delete_message(group_id, msg_id)
+                except Exception:
+                    pass
+                final_text = (
+                    f"🚫 用户 {display_name}\n"
+                    f"📌 触发原因：{reason}（已被 {count} 位成员举报）\n"
+                    "🔒 处理结果：永久禁止在本群发言。\n"
+                    "⚠️ 疑似引流/广告账号，请谨慎。"
+                )
+                try:
+                    await bot.edit_message_text(chat_id=group_id, message_id=warning_id, text=final_text, reply_markup=None)
+                    await bot.delete_message(group_id, warning_id)
+                except Exception:
+                    pass
+                async with lock:
+                    reports.pop(msg_id, None)
+                await save_data()
+                await callback.answer(f"✅ 举报({count}人)，已自动永封")
+                return
+            except Exception as e:
+                print("2层2举报永封失败:", e)
         
         await callback.answer(f"✅ 举报({count}人)")
         await save_data()
