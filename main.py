@@ -58,13 +58,11 @@ media_stats = {"message_counts": {}, "text_counts": {}, "unlocked": {}, "boosts"
 # 媒体消息举报/点赞（内存即可，按消息维度）
 media_reports = {}
 media_reports_lock = asyncio.Lock()
-# 举报按钮限流：连续两条媒体 20 分钟；一天超过 3 次当天失效
-MEDIA_REPORT_COOLDOWN_SEC = 20 * 60
-MEDIA_REPORT_MAX_PER_DAY = 3
 media_report_last = {}  # (uid,) -> (msg_id, time) 最近一次举报的媒体
 media_report_day_count = {}  # (uid, date_str) -> count
-MEDIA_UNLOCK_MSG_COUNT = 50
-MEDIA_UNLOCK_BOOSTS = 4
+# 召唤代发：未解锁用户发「召唤」后下一次媒体由机器人代发（避免炸群）
+summon_pending = {}  # (group_id, user_id) -> timestamp
+SUMMON_TIMEOUT_SEC = 300
 
 # ==================== 配置函数 ====================
 def _default_group_config():
@@ -96,7 +94,14 @@ def _default_group_config():
             "delete_user_sec": 0,
             "delete_bot_sec": 0
         },
-        "exempt_users": {}
+        "exempt_users": {},
+        "repeat_window_seconds": 2 * 3600,
+        "repeat_max_count": 3,
+        "repeat_ban_seconds": 86400,
+        "media_unlock_msg_count": 50,
+        "media_unlock_boosts": 4,
+        "media_report_cooldown_sec": 20 * 60,
+        "media_report_max_per_day": 3,
     }
 
 async def load_config():
@@ -170,18 +175,22 @@ def _media_key(group_id: int, user_id: int) -> str:
     return f"{group_id}_{user_id}"
 
 def _can_send_media(group_id: int, user_id: int, is_premium: bool) -> bool:
-    """是否已解锁发媒体：50 条合规消息 / 会员 / 助力 4 次"""
+    """是否已解锁发媒体：合规消息数/会员/助力（阈值从群配置读）"""
+    cfg = get_group_config(group_id)
+    need_boosts = cfg.get("media_unlock_boosts", 4)
     key = _media_key(group_id, user_id)
     if media_stats["unlocked"].get(key):
         return True
     if is_premium:
         return True
-    if media_stats["boosts"].get(key, 0) >= MEDIA_UNLOCK_BOOSTS:
+    if media_stats["boosts"].get(key, 0) >= need_boosts:
         return True
     return False
 
 async def _increment_media_count(group_id: int, user_id: int, normalized_text: str) -> bool:
-    """合规消息计数（同一条超过 10 次不计数）。返回是否因本次达到 50 而刚解锁。"""
+    """合规消息计数（同一条超过 10 次不计数）。返回是否因本次达到阈值而刚解锁。"""
+    cfg = get_group_config(group_id)
+    need_count = cfg.get("media_unlock_msg_count", 50)
     key = _media_key(group_id, user_id)
     if media_stats["unlocked"].get(key):
         return False
@@ -191,7 +200,7 @@ async def _increment_media_count(group_id: int, user_id: int, normalized_text: s
     tc[normalized_text] = tc.get(normalized_text, 0) + 1
     count = media_stats["message_counts"].get(key, 0) + 1
     media_stats["message_counts"][key] = count
-    if count >= MEDIA_UNLOCK_MSG_COUNT:
+    if count >= need_count:
         media_stats["unlocked"][key] = True
         await save_media_stats()
         return True
@@ -224,6 +233,13 @@ class AdminStates(StatesGroup):
     EditFillSpaceRatio = State()
     EditMuteHours = State()
     EditReportedThreshold = State()
+    EditRepeatWindow = State()
+    EditRepeatMaxCount = State()
+    EditRepeatBanSec = State()
+    EditMediaUnlockMsg = State()
+    EditMediaUnlockBoosts = State()
+    EditMediaReportCooldown = State()
+    EditMediaReportMaxDay = State()
 
 # ==================== UI 键盘 ====================
 def get_main_menu_keyboard():
@@ -247,6 +263,9 @@ def get_group_menu_keyboard(group_id: int):
         [InlineKeyboardButton(text="💬 消息检测", callback_data=f"submenu_message:{group_id}")],
         [InlineKeyboardButton(text="⏱️ 短消息/垃圾", callback_data=f"submenu_short:{group_id}")],
         [InlineKeyboardButton(text="⚠️ 违规处理", callback_data=f"submenu_violation:{group_id}")],
+        [InlineKeyboardButton(text="🔁 重复发言", callback_data=f"submenu_repeat:{group_id}")],
+        [InlineKeyboardButton(text="📎 媒体权限", callback_data=f"submenu_media_perm:{group_id}")],
+        [InlineKeyboardButton(text="📣 媒体举报", callback_data=f"submenu_media_report:{group_id}")],
         [InlineKeyboardButton(text="🤖 自动回复", callback_data=f"submenu_autoreply:{group_id}")],
         [InlineKeyboardButton(text="🎛️ 基础设置", callback_data=f"submenu_basic:{group_id}")],
         [InlineKeyboardButton(text="⬅️ 返回", callback_data="back_choose_group")],
@@ -331,6 +350,41 @@ def get_basic_menu_keyboard(group_id: int):
     enabled = "✅" if cfg.get("enabled") else "❌"
     buttons = [
         [InlineKeyboardButton(text=f"状态: {enabled}", callback_data=f"toggle_group:{group_id}")],
+        [InlineKeyboardButton(text="⬅️ 返回", callback_data=f"group_menu:{group_id}")],
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+def get_repeat_menu_keyboard(group_id: int):
+    cfg = get_group_config(group_id)
+    w = cfg.get("repeat_window_seconds", 7200)
+    m = cfg.get("repeat_max_count", 3)
+    b = cfg.get("repeat_ban_seconds", 86400)
+    buttons = [
+        [InlineKeyboardButton(text=f"时间窗口: {w // 3600}h", callback_data=f"edit_repeat_window:{group_id}")],
+        [InlineKeyboardButton(text=f"触发次数: {m}次", callback_data=f"edit_repeat_max:{group_id}")],
+        [InlineKeyboardButton(text=f"首次禁言: {b // 3600}h", callback_data=f"edit_repeat_ban:{group_id}")],
+        [InlineKeyboardButton(text="⬅️ 返回", callback_data=f"group_menu:{group_id}")],
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+def get_media_perm_menu_keyboard(group_id: int):
+    cfg = get_group_config(group_id)
+    msg = cfg.get("media_unlock_msg_count", 50)
+    boost = cfg.get("media_unlock_boosts", 4)
+    buttons = [
+        [InlineKeyboardButton(text=f"解锁所需消息数: {msg}", callback_data=f"edit_media_msg:{group_id}")],
+        [InlineKeyboardButton(text=f"解锁所需助力: {boost}", callback_data=f"edit_media_boosts:{group_id}")],
+        [InlineKeyboardButton(text="⬅️ 返回", callback_data=f"group_menu:{group_id}")],
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+def get_media_report_menu_keyboard(group_id: int):
+    cfg = get_group_config(group_id)
+    cooldown = cfg.get("media_report_cooldown_sec", 20 * 60)
+    max_day = cfg.get("media_report_max_per_day", 3)
+    buttons = [
+        [InlineKeyboardButton(text=f"连续举报冷却: {cooldown // 60}分钟", callback_data=f"edit_media_cooldown:{group_id}")],
+        [InlineKeyboardButton(text=f"每日举报上限: {max_day}次", callback_data=f"edit_media_maxday:{group_id}")],
         [InlineKeyboardButton(text="⬅️ 返回", callback_data=f"group_menu:{group_id}")],
     ]
     return InlineKeyboardMarkup(inline_keyboard=buttons)
@@ -893,6 +947,234 @@ async def process_report_threshold(message: Message, state: FSMContext):
     except Exception as e:
         await message.reply(f"❌ {str(e)}")
 
+# ==================== 重复发言 ====================
+@router.callback_query(F.data.startswith("submenu_repeat:"), F.from_user.id.in_(ADMIN_IDS))
+async def repeat_submenu(callback: CallbackQuery):
+    try:
+        group_id = int(callback.data.split(":", 1)[1])
+        cfg = get_group_config(group_id)
+        w = cfg.get("repeat_window_seconds", 7200)
+        m = cfg.get("repeat_max_count", 3)
+        b = cfg.get("repeat_ban_seconds", 86400)
+        text = f"重复发言\n窗口: {w // 3600}h\n触发: {m}次\n首次禁言: {b // 3600}h"
+        kb = get_repeat_menu_keyboard(group_id)
+        await callback.message.edit_text(text, reply_markup=kb)
+        await callback.answer()
+    except Exception as e:
+        await callback.answer(f"❌ {str(e)}", show_alert=True)
+
+@router.callback_query(F.data.startswith("edit_repeat_window:"), F.from_user.id.in_(ADMIN_IDS))
+async def edit_repeat_window(callback: CallbackQuery, state: FSMContext):
+    try:
+        group_id = int(callback.data.split(":", 1)[1])
+        cfg = get_group_config(group_id)
+        current = cfg.get("repeat_window_seconds", 7200)
+        await callback.message.edit_text(f"重复检测时间窗口（小时）（当前: {current // 3600}）：", reply_markup=None)
+        await state.update_data(group_id=group_id)
+        await state.set_state(AdminStates.EditRepeatWindow)
+        await callback.answer()
+    except Exception as e:
+        await callback.answer(f"❌ {str(e)}", show_alert=True)
+
+@router.message(StateFilter(AdminStates.EditRepeatWindow), F.from_user.id.in_(ADMIN_IDS))
+async def process_repeat_window(message: Message, state: FSMContext):
+    try:
+        data = await state.get_data()
+        group_id = data.get("group_id")
+        cfg = get_group_config(group_id)
+        cfg["repeat_window_seconds"] = int(message.text.strip()) * 3600
+        await save_config()
+        await message.reply("✅ 已更新", reply_markup=get_repeat_menu_keyboard(group_id))
+        await state.set_state(AdminStates.GroupMenu)
+    except (ValueError, Exception) as e:
+        await message.reply(f"❌ 请输入数字: {e}")
+
+@router.callback_query(F.data.startswith("edit_repeat_max:"), F.from_user.id.in_(ADMIN_IDS))
+async def edit_repeat_max(callback: CallbackQuery, state: FSMContext):
+    try:
+        group_id = int(callback.data.split(":", 1)[1])
+        cfg = get_group_config(group_id)
+        current = cfg.get("repeat_max_count", 3)
+        await callback.message.edit_text(f"重复几次触发（当前: {current}）：", reply_markup=None)
+        await state.update_data(group_id=group_id)
+        await state.set_state(AdminStates.EditRepeatMaxCount)
+        await callback.answer()
+    except Exception as e:
+        await callback.answer(f"❌ {str(e)}", show_alert=True)
+
+@router.message(StateFilter(AdminStates.EditRepeatMaxCount), F.from_user.id.in_(ADMIN_IDS))
+async def process_repeat_max(message: Message, state: FSMContext):
+    try:
+        data = await state.get_data()
+        group_id = data.get("group_id")
+        cfg = get_group_config(group_id)
+        cfg["repeat_max_count"] = int(message.text.strip())
+        await save_config()
+        await message.reply("✅ 已更新", reply_markup=get_repeat_menu_keyboard(group_id))
+        await state.set_state(AdminStates.GroupMenu)
+    except (ValueError, Exception) as e:
+        await message.reply(f"❌ 请输入数字: {e}")
+
+@router.callback_query(F.data.startswith("edit_repeat_ban:"), F.from_user.id.in_(ADMIN_IDS))
+async def edit_repeat_ban(callback: CallbackQuery, state: FSMContext):
+    try:
+        group_id = int(callback.data.split(":", 1)[1])
+        cfg = get_group_config(group_id)
+        current = cfg.get("repeat_ban_seconds", 86400)
+        await callback.message.edit_text(f"首次重复违规禁言时长（小时）（当前: {current // 3600}）：", reply_markup=None)
+        await state.update_data(group_id=group_id)
+        await state.set_state(AdminStates.EditRepeatBanSec)
+        await callback.answer()
+    except Exception as e:
+        await callback.answer(f"❌ {str(e)}", show_alert=True)
+
+@router.message(StateFilter(AdminStates.EditRepeatBanSec), F.from_user.id.in_(ADMIN_IDS))
+async def process_repeat_ban(message: Message, state: FSMContext):
+    try:
+        data = await state.get_data()
+        group_id = data.get("group_id")
+        cfg = get_group_config(group_id)
+        cfg["repeat_ban_seconds"] = int(message.text.strip()) * 3600
+        await save_config()
+        await message.reply("✅ 已更新", reply_markup=get_repeat_menu_keyboard(group_id))
+        await state.set_state(AdminStates.GroupMenu)
+    except (ValueError, Exception) as e:
+        await message.reply(f"❌ 请输入数字: {e}")
+
+# ==================== 媒体权限 ====================
+@router.callback_query(F.data.startswith("submenu_media_perm:"), F.from_user.id.in_(ADMIN_IDS))
+async def media_perm_submenu(callback: CallbackQuery):
+    try:
+        group_id = int(callback.data.split(":", 1)[1])
+        cfg = get_group_config(group_id)
+        msg = cfg.get("media_unlock_msg_count", 50)
+        boost = cfg.get("media_unlock_boosts", 4)
+        text = f"媒体权限\n解锁所需消息: {msg}\n解锁所需助力: {boost}"
+        kb = get_media_perm_menu_keyboard(group_id)
+        await callback.message.edit_text(text, reply_markup=kb)
+        await callback.answer()
+    except Exception as e:
+        await callback.answer(f"❌ {str(e)}", show_alert=True)
+
+@router.callback_query(F.data.startswith("edit_media_msg:"), F.from_user.id.in_(ADMIN_IDS))
+async def edit_media_msg(callback: CallbackQuery, state: FSMContext):
+    try:
+        group_id = int(callback.data.split(":", 1)[1])
+        cfg = get_group_config(group_id)
+        current = cfg.get("media_unlock_msg_count", 50)
+        await callback.message.edit_text(f"解锁发媒体所需合规消息数（当前: {current}）：", reply_markup=None)
+        await state.update_data(group_id=group_id)
+        await state.set_state(AdminStates.EditMediaUnlockMsg)
+        await callback.answer()
+    except Exception as e:
+        await callback.answer(f"❌ {str(e)}", show_alert=True)
+
+@router.message(StateFilter(AdminStates.EditMediaUnlockMsg), F.from_user.id.in_(ADMIN_IDS))
+async def process_media_msg(message: Message, state: FSMContext):
+    try:
+        data = await state.get_data()
+        group_id = data.get("group_id")
+        cfg = get_group_config(group_id)
+        cfg["media_unlock_msg_count"] = int(message.text.strip())
+        await save_config()
+        await message.reply("✅ 已更新", reply_markup=get_media_perm_menu_keyboard(group_id))
+        await state.set_state(AdminStates.GroupMenu)
+    except (ValueError, Exception) as e:
+        await message.reply(f"❌ 请输入数字: {e}")
+
+@router.callback_query(F.data.startswith("edit_media_boosts:"), F.from_user.id.in_(ADMIN_IDS))
+async def edit_media_boosts(callback: CallbackQuery, state: FSMContext):
+    try:
+        group_id = int(callback.data.split(":", 1)[1])
+        cfg = get_group_config(group_id)
+        current = cfg.get("media_unlock_boosts", 4)
+        await callback.message.edit_text(f"解锁发媒体所需助力次数（当前: {current}）：", reply_markup=None)
+        await state.update_data(group_id=group_id)
+        await state.set_state(AdminStates.EditMediaUnlockBoosts)
+        await callback.answer()
+    except Exception as e:
+        await callback.answer(f"❌ {str(e)}", show_alert=True)
+
+@router.message(StateFilter(AdminStates.EditMediaUnlockBoosts), F.from_user.id.in_(ADMIN_IDS))
+async def process_media_boosts(message: Message, state: FSMContext):
+    try:
+        data = await state.get_data()
+        group_id = data.get("group_id")
+        cfg = get_group_config(group_id)
+        cfg["media_unlock_boosts"] = int(message.text.strip())
+        await save_config()
+        await message.reply("✅ 已更新", reply_markup=get_media_perm_menu_keyboard(group_id))
+        await state.set_state(AdminStates.GroupMenu)
+    except (ValueError, Exception) as e:
+        await message.reply(f"❌ 请输入数字: {e}")
+
+# ==================== 媒体举报 ====================
+@router.callback_query(F.data.startswith("submenu_media_report:"), F.from_user.id.in_(ADMIN_IDS))
+async def media_report_submenu(callback: CallbackQuery):
+    try:
+        group_id = int(callback.data.split(":", 1)[1])
+        cfg = get_group_config(group_id)
+        cooldown = cfg.get("media_report_cooldown_sec", 20 * 60)
+        max_day = cfg.get("media_report_max_per_day", 3)
+        text = f"媒体举报\n连续举报冷却: {cooldown // 60}分钟\n每日上限: {max_day}次"
+        kb = get_media_report_menu_keyboard(group_id)
+        await callback.message.edit_text(text, reply_markup=kb)
+        await callback.answer()
+    except Exception as e:
+        await callback.answer(f"❌ {str(e)}", show_alert=True)
+
+@router.callback_query(F.data.startswith("edit_media_cooldown:"), F.from_user.id.in_(ADMIN_IDS))
+async def edit_media_cooldown(callback: CallbackQuery, state: FSMContext):
+    try:
+        group_id = int(callback.data.split(":", 1)[1])
+        cfg = get_group_config(group_id)
+        current = cfg.get("media_report_cooldown_sec", 20 * 60)
+        await callback.message.edit_text(f"连续举报冷却（分钟）（当前: {current // 60}）：", reply_markup=None)
+        await state.update_data(group_id=group_id)
+        await state.set_state(AdminStates.EditMediaReportCooldown)
+        await callback.answer()
+    except Exception as e:
+        await callback.answer(f"❌ {str(e)}", show_alert=True)
+
+@router.message(StateFilter(AdminStates.EditMediaReportCooldown), F.from_user.id.in_(ADMIN_IDS))
+async def process_media_cooldown(message: Message, state: FSMContext):
+    try:
+        data = await state.get_data()
+        group_id = data.get("group_id")
+        cfg = get_group_config(group_id)
+        cfg["media_report_cooldown_sec"] = int(message.text.strip()) * 60
+        await save_config()
+        await message.reply("✅ 已更新", reply_markup=get_media_report_menu_keyboard(group_id))
+        await state.set_state(AdminStates.GroupMenu)
+    except (ValueError, Exception) as e:
+        await message.reply(f"❌ 请输入数字: {e}")
+
+@router.callback_query(F.data.startswith("edit_media_maxday:"), F.from_user.id.in_(ADMIN_IDS))
+async def edit_media_maxday(callback: CallbackQuery, state: FSMContext):
+    try:
+        group_id = int(callback.data.split(":", 1)[1])
+        cfg = get_group_config(group_id)
+        current = cfg.get("media_report_max_per_day", 3)
+        await callback.message.edit_text(f"每日举报次数上限（当前: {current}）：", reply_markup=None)
+        await state.update_data(group_id=group_id)
+        await state.set_state(AdminStates.EditMediaReportMaxDay)
+        await callback.answer()
+    except Exception as e:
+        await callback.answer(f"❌ {str(e)}", show_alert=True)
+
+@router.message(StateFilter(AdminStates.EditMediaReportMaxDay), F.from_user.id.in_(ADMIN_IDS))
+async def process_media_maxday(message: Message, state: FSMContext):
+    try:
+        data = await state.get_data()
+        group_id = data.get("group_id")
+        cfg = get_group_config(group_id)
+        cfg["media_report_max_per_day"] = int(message.text.strip())
+        await save_config()
+        await message.reply("✅ 已更新", reply_markup=get_media_report_menu_keyboard(group_id))
+        await state.set_state(AdminStates.GroupMenu)
+    except (ValueError, Exception) as e:
+        await message.reply(f"❌ 请输入数字: {e}")
+
 # ==================== 自动回复 ====================
 @router.callback_query(F.data.startswith("submenu_autoreply:"), F.from_user.id.in_(ADMIN_IDS))
 async def autoreply_submenu(callback: CallbackQuery):
@@ -1122,12 +1404,6 @@ FILL_CHARS = set(r" .,，。！？*\\\~`-_=+[]{}()\"'\\|\n\t\r　")
 
 user_short_msg_history = {}
 
-# ==================== 重复发言检测配置 ====================
-# 2 小时内不能重复发送相同内容 3 次
-REPEAT_WINDOW_SECONDS = 2 * 3600          # 检测时间窗口：2 小时
-REPEAT_MAX_COUNT = 3                      # 窗口内相同内容达到 3 次判定为违规
-REPEAT_BAN_DURATION_SECONDS = 86400       # 第一次重复违规禁言 1 天
-
 # key: (group_id, user_id, normalized_text) -> deque[timestamp]
 repeat_message_history = {}
 # key: (group_id, user_id) -> int（0=未因重复违规，1=已因重复违规被禁言 1 次，2=已因重复违规被永封）
@@ -1151,7 +1427,7 @@ def _get_display_name_from_message(message: Message, user_id: int) -> str:
 
 async def handle_repeat_message(message: Message) -> bool:
     """
-    检测用户是否在 2 小时内重复发送相同内容
+    检测用户是否在配置时间窗口内重复发送相同内容
     返回 True 表示已经进行了处罚/提醒并且本次消息后续逻辑应中止
     """
     if not message.text:
@@ -1159,6 +1435,11 @@ async def handle_repeat_message(message: Message) -> bool:
 
     user_id = message.from_user.id
     group_id = message.chat.id
+    cfg = get_group_config(group_id)
+    window_sec = cfg.get("repeat_window_seconds", 2 * 3600)
+    max_count = cfg.get("repeat_max_count", 3)
+    ban_sec = cfg.get("repeat_ban_seconds", 86400)
+
     norm_text = _normalize_text(message.text)
     if not norm_text:
         return False
@@ -1170,34 +1451,29 @@ async def handle_repeat_message(message: Message) -> bool:
         repeat_message_history[key] = deque(maxlen=10)
     history = repeat_message_history[key]
 
-    # 滚动窗口：仅保留 2 小时内的记录
-    while history and now - history[0] > REPEAT_WINDOW_SECONDS:
+    while history and now - history[0] > window_sec:
         history.popleft()
 
     history.append(now)
     count = len(history)
 
-    # 第 2 次：提醒用户不要重复发言
     if count == 2:
         warn_text = (
-            "⚠️ 检测到你在 2 小时内重复发送相同内容（2/3），请停止刷屏。"
+            f"⚠️ 检测到你在 {window_sec // 3600} 小时内重复发送相同内容（2/{max_count}），请停止刷屏。"
         )
         try:
             await message.reply(warn_text)
         except Exception:
             pass
-        # 仅提醒，不拦截后续其他违规检测
         return False
 
-    # 第 3 次及以上：按“第一次重复违规”或“再次重复违规”处理
-    if count >= REPEAT_MAX_COUNT:
+    if count >= max_count:
         level_key = (group_id, user_id)
         current_level = repeat_violation_level.get(level_key, 0)
         display_name = _get_display_name_from_message(message, user_id)
 
-        # 第一次达到 3/3：禁言 1 天
         if current_level == 0:
-            until_date = int(now) + REPEAT_BAN_DURATION_SECONDS
+            until_date = int(now) + ban_sec
             try:
                 await bot.restrict_chat_member(
                     chat_id=group_id,
@@ -1227,7 +1503,7 @@ async def handle_repeat_message(message: Message) -> bool:
 
             notice = (
                 f"🚫 用户 {display_name}\n"
-                f"📌 触发原因：在 2 小时内多次重复发送相同内容（{REPEAT_MAX_COUNT}/{REPEAT_MAX_COUNT}）。\n"
+                f"📌 触发原因：在配置时间窗口内多次重复发送相同内容（{max_count}/{max_count}）。\n"
                 f"🔒 处理结果：已被本群禁言 1 天。\n"
                 f"⚠️ 疑似刷屏/引流，请谨慎。"
             )
@@ -1370,7 +1646,7 @@ async def cmd_set_boost(message: Message):
 
 @router.message(F.chat.id.in_(GROUP_IDS), F.photo | F.video | F.voice | F.video_note)
 async def on_media_message(message: Message):
-    """媒体消息：无权限则删除并提示；有权限则回复举报/点赞按钮"""
+    """媒体消息：无权限则删除并提示或召唤代发；有权限则回复举报/点赞按钮"""
     if not message.from_user or message.from_user.is_bot:
         return
     cfg = get_group_config(message.chat.id)
@@ -1378,6 +1654,7 @@ async def on_media_message(message: Message):
         return
     user_id = message.from_user.id
     group_id = message.chat.id
+    now = time.time()
     is_premium = False
     try:
         mem = await bot.get_chat_member(group_id, user_id)
@@ -1385,16 +1662,39 @@ async def on_media_message(message: Message):
     except Exception:
         pass
     if not _can_send_media(group_id, user_id, is_premium):
-        try:
-            await message.delete()
-        except Exception:
-            pass
-        name = _get_display_name_from_message(message, user_id)
-        await bot.send_message(
-            group_id,
-            f"⚠️ {name} 尚未解锁发媒体权限。\n"
-            f"发送「权限」可查看进度；满 {MEDIA_UNLOCK_MSG_COUNT} 条合规消息或 Telegram 会员或为群组助力 {MEDIA_UNLOCK_BOOSTS} 次即可解锁。"
-        )
+        # 召唤代发：用户已发「召唤」则本次由机器人代发
+        sk = (group_id, user_id)
+        if sk in summon_pending and (now - summon_pending[sk]) <= SUMMON_TIMEOUT_SEC:
+            try:
+                await message.delete()
+            except Exception:
+                pass
+            try:
+                if message.photo:
+                    await bot.send_photo(group_id, message.photo[-1].file_id, caption=message.caption)
+                elif message.video:
+                    await bot.send_video(group_id, message.video.file_id, caption=message.caption)
+                elif message.voice:
+                    await bot.send_voice(group_id, message.voice.file_id, caption=message.caption)
+                elif message.video_note:
+                    await bot.send_video_note(group_id, message.video_note.file_id)
+            except Exception as e:
+                print(f"召唤代发失败: {e}")
+            summon_pending.pop(sk, None)
+        else:
+            try:
+                await message.delete()
+            except Exception:
+                pass
+            need_msg = cfg.get("media_unlock_msg_count", 50)
+            need_boosts = cfg.get("media_unlock_boosts", 4)
+            name = _get_display_name_from_message(message, user_id)
+            await bot.send_message(
+                group_id,
+                f"⚠️ {name} 尚未解锁发媒体权限。\n"
+                f"发送「权限」可查看进度；满 {need_msg} 条合规消息或 Telegram 会员或为群组助力 {need_boosts} 次即可解锁。\n"
+                f"现阶段为避免炸群，不满足条件的用户可输入「召唤」后发送图片/视频/语音，由机器人代发。"
+            )
         return
     reply = await message.reply("📎 媒体消息", reply_markup=_media_reply_buttons(group_id, message.message_id, 0, 0))
     async with media_reports_lock:
@@ -1420,6 +1720,20 @@ async def detect_and_warn(message: Message):
     user_id = message.from_user.id
     group_id = message.chat.id
 
+    # 「召唤」：未解锁用户可让机器人代发下一次媒体（为避免炸群）
+    if message.text and message.text.strip() == "召唤":
+        if not _can_send_media(group_id, user_id, False):
+            is_premium = False
+            try:
+                mem = await bot.get_chat_member(group_id, user_id)
+                is_premium = getattr(mem, "is_premium", False) or False
+            except Exception:
+                pass
+            if not _can_send_media(group_id, user_id, is_premium):
+                summon_pending[(group_id, user_id)] = time.time()
+                await message.reply("请直接发送你要发布的图片/视频/语音，我将代你发出（为避免炸群）。")
+        return
+
     # 「权限」查询发媒体进度
     if message.text and message.text.strip() == "权限":
         key = _media_key(group_id, user_id)
@@ -1432,19 +1746,21 @@ async def detect_and_warn(message: Message):
             is_premium = getattr(mem, "is_premium", False) or False
         except Exception:
             pass
+        need_msg = cfg.get("media_unlock_msg_count", 50)
+        need_boosts = cfg.get("media_unlock_boosts", 4)
         if unlocked:
-            await message.reply(f"✅ 你已解锁在本群直接发送图片/视频/语音（合规消息已满 {MEDIA_UNLOCK_MSG_COUNT} 条）。")
+            await message.reply(f"✅ 你已解锁在本群直接发送图片/视频/语音（合规消息已满 {need_msg} 条）。")
             return
         if is_premium:
             await message.reply("✅ 你已具备发媒体权限（Telegram 会员）。")
             return
-        if boosts >= MEDIA_UNLOCK_BOOSTS:
+        if boosts >= need_boosts:
             await message.reply(f"✅ 你已解锁发媒体权限（已为群组助力 {boosts} 次）。")
             return
         await message.reply(
             f"📊 发媒体权限进度\n"
-            f"· 合规消息：{count}/{MEDIA_UNLOCK_MSG_COUNT}（满 50 条可解锁）\n"
-            f"· 群组助力：{boosts}/{MEDIA_UNLOCK_BOOSTS}（满 4 次可解锁）\n"
+            f"· 合规消息：{count}/{need_msg}（满 {need_msg} 条可解锁）\n"
+            f"· 群组助力：{boosts}/{need_boosts}（满 {need_boosts} 次可解锁）\n"
             f"· Telegram 会员：{'是' if is_premium else '否'}\n"
             f"（刷屏、重复发言、短消息等不计入合规消息）"
         )
@@ -1658,10 +1974,11 @@ async def detect_and_warn(message: Message):
                 just_unlocked = await _increment_media_count(group_id, user_id, norm)
                 if just_unlocked:
                     name = _get_display_name_from_message(message, user_id)
+                    need_msg = cfg.get("media_unlock_msg_count", 50)
                     try:
                         await bot.send_message(
                             group_id,
-                            f"🎉 {name} 已在本群发送合规消息满 {MEDIA_UNLOCK_MSG_COUNT} 条，解锁直接发送图片/视频/语音的权限。"
+                            f"🎉 {name} 已在本群发送合规消息满 {need_msg} 条，解锁直接发送图片/视频/语音的权限。"
                         )
                     except Exception:
                         pass
@@ -1871,7 +2188,7 @@ async def handle_exempt(callback: CallbackQuery):
 
 @router.callback_query(F.data.startswith("mr:"))
 async def handle_media_report(callback: CallbackQuery):
-    """举报儿童色情：限流 20 分钟连续两条、一天超过 3 次失效"""
+    """举报儿童色情：限流（连续两条 cooldown、一天上限）从群配置读"""
     try:
         parts = callback.data.split(":", 2)
         if len(parts) != 3:
@@ -1879,22 +2196,23 @@ async def handle_media_report(callback: CallbackQuery):
             return
         chat_id = int(parts[1])
         media_msg_id = int(parts[2])
+        cfg = get_group_config(chat_id)
+        cooldown_sec = cfg.get("media_report_cooldown_sec", 20 * 60)
+        max_per_day = cfg.get("media_report_max_per_day", 3)
         uid = callback.from_user.id
         now = time.time()
         day_key = (uid, time.strftime("%Y-%m-%d", time.localtime(now)))
 
-        # 一天超过 3 次：本次不计数，提示联系管理员
         day_count = media_report_day_count.get(day_key, 0)
-        if day_count >= MEDIA_REPORT_MAX_PER_DAY:
+        if day_count >= max_per_day:
             await callback.answer("今日举报次数已达上限，如有问题请直接联系管理员。", show_alert=True)
             return
 
-        # 连续两条媒体 20 分钟内：不计数
         last = media_report_last.get(uid)
         if last:
             last_mid, last_ts = last
-            if last_mid != media_msg_id and (now - last_ts) < MEDIA_REPORT_COOLDOWN_SEC:
-                await callback.answer("请勿在 20 分钟内对多条媒体连续举报，请稍后再试。", show_alert=True)
+            if last_mid != media_msg_id and (now - last_ts) < cooldown_sec:
+                await callback.answer(f"请勿在 {cooldown_sec // 60} 分钟内对多条媒体连续举报，请稍后再试。", show_alert=True)
                 return
         media_report_last[uid] = (media_msg_id, now)
         media_report_day_count[day_key] = day_count + 1
@@ -1997,13 +2315,17 @@ async def handle_media_like(callback: CallbackQuery):
         print("媒体点赞异常:", e)
         await callback.answer("❌ 失败", show_alert=True)
 
-def _media_rules_text() -> str:
+def _media_rules_text(group_id: int) -> str:
+    cfg = get_group_config(group_id)
+    need_msg = cfg.get("media_unlock_msg_count", 50)
+    need_boosts = cfg.get("media_unlock_boosts", 4)
     return (
         "📋 本群发媒体（图片/视频/语音）规则\n\n"
-        f"· 合规消息满 {MEDIA_UNLOCK_MSG_COUNT} 条可解锁发媒体\n"
-        f"· 为群组助力 {MEDIA_UNLOCK_BOOSTS} 次可解锁\n"
+        f"· 合规消息满 {need_msg} 条可解锁发媒体\n"
+        f"· 为群组助力 {need_boosts} 次可解锁\n"
         "· Telegram 会员可直接发送\n"
-        "· 刷屏、重复发言、短消息等不计入合规条数\n\n"
+        "· 刷屏、重复发言、短消息等不计入合规条数\n"
+        "· 未解锁可发「召唤」后发图，由机器人代发\n\n"
         "发送「权限」可随时查询自己的进度。"
     )
 
@@ -2016,7 +2338,7 @@ async def broadcast_media_rules_every_2h():
                 cfg = get_group_config(gid)
                 if not cfg.get("enabled", True):
                     continue
-                await bot.send_message(gid, _media_rules_text())
+                await bot.send_message(gid, _media_rules_text(gid))
             except Exception as e:
                 print(f"广播媒体规则失败 {gid}: {e}")
 
