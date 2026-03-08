@@ -46,7 +46,9 @@ except ImportError:
     admin_router = None
 
 # ==================== 数据文件 ====================
-# 使用环境变量 DATA_DIR；Railway 需将 Volume 挂载到该路径（如 /data），重新部署后配置与关键词才不丢失
+# 使用环境变量 DATA_DIR；Railway 需将 Volume 挂载到该路径（如 /data），重新部署后配置与名单才不丢失
+# 以下数据均持久化，重启不丢失：CONFIG_FILE（豁免名单 exempt_users、媒体白名单 media_unlock_whitelist、
+# 重复发言豁免词 repeat_exempt_keywords、各群关键词与开关等）；DATA_FILE 举报记录；MEDIA_STATS_FILE 合规数/助力/解锁
 DATA_DIR = os.getenv("DATA_DIR", "/data")
 os.makedirs(DATA_DIR, exist_ok=True)
 DATA_FILE = os.path.join(DATA_DIR, "reports.json")
@@ -121,12 +123,12 @@ def _default_group_config():
     }
 
 async def load_config():
+    """从 CONFIG_FILE 加载配置；已保存的豁免名单、白名单、豁免词等全部保留，仅对缺失项补默认值"""
     global config
     try:
         if os.path.exists(CONFIG_FILE):
             with open(CONFIG_FILE, "r", encoding="utf-8") as f:
                 config = json.load(f)
-            # 合并默认值，保证新增配置项有默认值且已保存的关键词等不丢失
             if "groups" not in config:
                 config["groups"] = {}
             for gid, saved in list(config["groups"].items()):
@@ -143,6 +145,7 @@ async def load_config():
         config = {"groups": {}}
 
 async def save_config():
+    """保存配置到 CONFIG_FILE，豁免名单/白名单/豁免词等所有名单均在此持久化，重启不丢失"""
     try:
         with open(CONFIG_FILE, "w", encoding="utf-8") as f:
             json.dump(config, f, ensure_ascii=False, indent=2)
@@ -2170,12 +2173,15 @@ async def on_media_message(message: Message):
                 pass
             need_msg = cfg.get("media_unlock_msg_count", 50)
             need_boosts = cfg.get("media_unlock_boosts", 4)
+            key = _media_key(group_id, user_id)
+            count = media_stats["message_counts"].get(key, 0)
+            boosts = media_stats["boosts"].get(key, 0)
             name = _get_display_name_from_message(message, user_id)
             await bot.send_message(
                 group_id,
-                f"⚠️ {name} 尚未解锁发媒体权限。\n"
-                f"发送「权限」可查看进度；满 {need_msg} 条合规消息即可解锁，或为群组助力 {need_boosts} 次即可解锁（仅 Telegram 会员可为群组助力）。\n"
-                f"现阶段为避免炸群，不满足条件的用户可输入「召唤」后发送图片/视频/语音，由机器人代发。"
+                f"⚠️ {name} 尚未解锁发媒体。\n"
+                f"📊 您的进度：发送合规消息 {count}/{need_msg}，助力 {boosts}/{need_boosts}（满其一即可解锁）。\n"
+                f"未解锁输入「召唤」机器人代发；输入「权限」查进度。"
             )
         return
     reply = await message.reply("📎 媒体消息", reply_markup=_media_reply_buttons(group_id, message.message_id, 0, 0))
@@ -2228,16 +2234,16 @@ async def detect_and_warn(message: Message):
         need_msg = cfg.get("media_unlock_msg_count", 50)
         need_boosts = cfg.get("media_unlock_boosts", 4)
         if unlocked:
-            await message.reply(f"✅ 你已解锁在本群直接发送图片/视频/语音（合规消息已满 {need_msg} 条）。")
+            await message.reply(f"✅ 已解锁发媒体（发送合规消息已满 {need_msg} 条）。")
             return
         if boosts >= need_boosts:
-            await message.reply(f"✅ 你已解锁发媒体权限（已为群组助力 {boosts} 次）。")
+            await message.reply(f"✅ 已解锁发媒体（已助力 {boosts} 次）。")
             return
         await message.reply(
-            f"📊 发媒体权限进度\n"
-            f"· 合规消息：{count}/{need_msg}（满 {need_msg} 条可解锁）\n"
-            f"· 群组助力：{boosts}/{need_boosts}（满 {need_boosts} 次可解锁，仅 Telegram 会员可为群组助力）\n"
-            f"（刷屏、重复发言、短消息等不计入合规消息）"
+            f"📊 发媒体进度\n"
+            f"· 发送合规消息：{count}/{need_msg}\n"
+            f"· 群组助力：{boosts}/{need_boosts}\n"
+            f"（刷屏/重复/短消息不计入）"
         )
         return
     
@@ -2789,16 +2795,13 @@ async def handle_media_like(callback: CallbackQuery):
         await callback.answer("❌ 失败", show_alert=True)
 
 def _media_rules_text(group_id: int) -> str:
+    """缩略版发媒体规则（广播用，无用户上下文故不含个人进度）"""
     cfg = get_group_config(group_id)
     need_msg = cfg.get("media_unlock_msg_count", 50)
     need_boosts = cfg.get("media_unlock_boosts", 4)
     return (
-        "📋 本群发媒体（图片/视频/语音）规则\n\n"
-        f"· 合规消息满 {need_msg} 条可解锁发媒体\n"
-        f"· 为群组助力 {need_boosts} 次可解锁（仅 Telegram 会员可为群组助力）\n"
-        "· 刷屏、重复发言、短消息等不计入合规条数\n"
-        "· 未解锁可发「召唤」后发图，由机器人代发\n\n"
-        "发送「权限」可随时查询自己的进度。"
+        f"📋 发媒体规则：合规消息发送满 {need_msg} 条或助力 {need_boosts} 次可解锁；"
+        "刷屏/重复/短消息不计入。未解锁可输入「召唤」代发。输入「权限」查进度。"
     )
 
 async def broadcast_media_rules_every_2h():
