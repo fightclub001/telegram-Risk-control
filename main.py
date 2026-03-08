@@ -85,7 +85,7 @@ def _default_group_config():
         "check_bio_link": True,
         "bio_keywords": ["qq:", "qq：", "qq号", "加qq", "扣扣", "微信", "wx:", "weixin", "加我微信", "wxid_", "幼女", "萝莉", "少妇", "人妻", "福利", "约炮", "onlyfans", "小红书", "抖音", "纸飞机", "机场", "t.me/", "@"],
         "check_bio_keywords": True,
-        "check_message_link": True,  # 消息内链接/@引流（与简介检测同组）
+        "check_message_link": True,  # 消息内链接/@引流（归属消息检测，与简介/名称同级）
         "display_keywords": ["加v", "加微信", "加qq", "加扣", "福利加", "约", "约炮", "资源私聊", "私我", "私聊我", "飞机", "纸飞机", "福利", "外围", "反差", "嫩模", "学生妹", "空姐", "人妻", "熟女", "onlyfans", "of", "leak", "nudes", "十八+", "av"],
         "check_display_keywords": True,
         "message_keywords": ["qq:", "qq号", "微信", "wx:", "幼女", "萝莉", "福利", "约炮", "onlyfans"],
@@ -425,12 +425,10 @@ def get_bio_menu_keyboard(group_id: int):
     cfg = get_group_config(group_id)
     link_status = "✅" if cfg.get("check_bio_link") else "❌"
     kw_status = "✅" if cfg.get("check_bio_keywords") else "❌"
-    msg_link_status = "✅" if cfg.get("check_message_link", True) else "❌"
     buttons = [
-        [InlineKeyboardButton(text=f"简介链接 {link_status}", callback_data=f"toggle_bio_link:{group_id}")],
-        [InlineKeyboardButton(text=f"简介敏感词 {kw_status}", callback_data=f"toggle_bio_keywords:{group_id}")],
-        [InlineKeyboardButton(text=f"消息链接/@引流 {msg_link_status}", callback_data=f"toggle_message_link:{group_id}")],
-        [InlineKeyboardButton(text="📋 编辑简介词汇", callback_data=f"edit_bio_kw:{group_id}")],
+        [InlineKeyboardButton(text=f"链接 {link_status}", callback_data=f"toggle_bio_link:{group_id}")],
+        [InlineKeyboardButton(text=f"敏感词 {kw_status}", callback_data=f"toggle_bio_keywords:{group_id}")],
+        [InlineKeyboardButton(text="📋 编辑词汇", callback_data=f"edit_bio_kw:{group_id}")],
         [InlineKeyboardButton(text="👀 查看", callback_data=f"view_bio_kw:{group_id}")],
         [InlineKeyboardButton(text="⬅️ 返回", callback_data=f"group_menu:{group_id}")],
     ]
@@ -450,9 +448,11 @@ def get_display_menu_keyboard(group_id: int):
 def get_message_menu_keyboard(group_id: int):
     cfg = get_group_config(group_id)
     status = "✅" if cfg.get("check_message_keywords") else "❌"
+    msg_link_status = "✅" if cfg.get("check_message_link", True) else "❌"
     norm_status = "✅" if cfg.get("message_keyword_normalize", True) else "❌"
     buttons = [
-        [InlineKeyboardButton(text=f"启用 {status}", callback_data=f"toggle_message:{group_id}")],
+        [InlineKeyboardButton(text=f"敏感词 {status}", callback_data=f"toggle_message:{group_id}")],
+        [InlineKeyboardButton(text=f"链接/@引流 {msg_link_status}", callback_data=f"toggle_message_link:{group_id}")],
         [InlineKeyboardButton(text=f"防拼字规避 {norm_status}", callback_data=f"toggle_message_normalize:{group_id}")],
         [InlineKeyboardButton(text="📋 编辑词汇", callback_data=f"edit_message_kw:{group_id}")],
         [InlineKeyboardButton(text="👀 查看", callback_data=f"view_message_kw:{group_id}")],
@@ -663,30 +663,10 @@ async def bio_submenu(callback: CallbackQuery):
         cfg = get_group_config(group_id)
         link_status = "✅" if cfg.get("check_bio_link") else "❌"
         kw_status = "✅" if cfg.get("check_bio_keywords") else "❌"
-        msg_link = "✅" if cfg.get("check_message_link", True) else "❌"
-        text = f"<b>{title}</b> › 简介与引流检测\n\n简介链接: {link_status}\n简介敏感词: {kw_status}\n消息链接/@引流: {msg_link}"
+        text = f"<b>{title}</b> › 简介检测\n\n链接: {link_status}\n敏感词: {kw_status}"
         kb = get_bio_menu_keyboard(group_id)
         await callback.message.edit_text(text, reply_markup=kb)
         await callback.answer()
-    except Exception as e:
-        await callback.answer(f"❌ {str(e)}", show_alert=True)
-
-@router.callback_query(F.data.startswith("toggle_message_link:"), F.from_user.id.in_(ADMIN_IDS))
-async def toggle_message_link(callback: CallbackQuery):
-    try:
-        group_id = int(callback.data.split(":", 1)[1])
-        cfg = get_group_config(group_id)
-        cfg["check_message_link"] = not cfg.get("check_message_link", True)
-        await save_config()
-        status = "✅" if cfg["check_message_link"] else "❌"
-        await callback.answer(f"消息链接/@引流: {status}", show_alert=True)
-        kb = get_bio_menu_keyboard(group_id)
-        title = await get_chat_title_safe(callback.bot, group_id)
-        link_status = "✅" if cfg.get("check_bio_link") else "❌"
-        kw_status = "✅" if cfg.get("check_bio_keywords") else "❌"
-        msg_link = "✅" if cfg.get("check_message_link", True) else "❌"
-        text = f"<b>{title}</b> › 简介与引流检测\n\n简介链接: {link_status}\n简介敏感词: {kw_status}\n消息链接/@引流: {msg_link}"
-        await callback.message.edit_text(text, reply_markup=kb)
     except Exception as e:
         await callback.answer(f"❌ {str(e)}", show_alert=True)
 
@@ -698,13 +678,12 @@ async def toggle_bio_link(callback: CallbackQuery):
         cfg["check_bio_link"] = not cfg.get("check_bio_link", True)
         await save_config()
         status = "✅" if cfg["check_bio_link"] else "❌"
-        await callback.answer(f"简介链接: {status}", show_alert=True)
+        await callback.answer(f"链接: {status}", show_alert=True)
         kb = get_bio_menu_keyboard(group_id)
         link_status = "✅" if cfg.get("check_bio_link") else "❌"
         kw_status = "✅" if cfg.get("check_bio_keywords") else "❌"
-        msg_link = "✅" if cfg.get("check_message_link", True) else "❌"
         breadcrumb = await get_chat_title_safe(callback.bot, group_id)
-        text = f"<b>{breadcrumb}</b> › 简介与引流检测\n\n简介链接: {link_status}\n简介敏感词: {kw_status}\n消息链接/@引流: {msg_link}"
+        text = f"<b>{breadcrumb}</b> › 简介检测\n\n链接: {link_status}\n敏感词: {kw_status}"
         await callback.message.edit_text(text, reply_markup=kb)
     except Exception as e:
         await callback.answer(f"❌ {str(e)}", show_alert=True)
@@ -717,13 +696,12 @@ async def toggle_bio_keywords(callback: CallbackQuery):
         cfg["check_bio_keywords"] = not cfg.get("check_bio_keywords", True)
         await save_config()
         status = "✅" if cfg["check_bio_keywords"] else "❌"
-        await callback.answer(f"简介敏感词: {status}", show_alert=True)
+        await callback.answer(f"敏感词: {status}", show_alert=True)
         kb = get_bio_menu_keyboard(group_id)
         link_status = "✅" if cfg.get("check_bio_link") else "❌"
         kw_status = "✅" if cfg.get("check_bio_keywords") else "❌"
-        msg_link = "✅" if cfg.get("check_message_link", True) else "❌"
         breadcrumb = await get_chat_title_safe(callback.bot, group_id)
-        text = f"<b>{breadcrumb}</b> › 简介与引流检测\n\n简介链接: {link_status}\n简介敏感词: {kw_status}\n消息链接/@引流: {msg_link}"
+        text = f"<b>{breadcrumb}</b> › 简介检测\n\n链接: {link_status}\n敏感词: {kw_status}"
         await callback.message.edit_text(text, reply_markup=kb)
     except Exception as e:
         await callback.answer(f"❌ {str(e)}", show_alert=True)
@@ -863,8 +841,9 @@ async def message_submenu(callback: CallbackQuery):
         title = await get_chat_title_safe(callback.bot, group_id)
         cfg = get_group_config(group_id)
         status = "✅" if cfg.get("check_message_keywords") else "❌"
+        msg_link = "✅" if cfg.get("check_message_link", True) else "❌"
         norm_status = "✅" if cfg.get("message_keyword_normalize", True) else "❌"
-        text = f"<b>{title}</b> › 消息检测\n\n启用: {status}\n防拼字规避（忽略空格标点匹配）: {norm_status}"
+        text = f"<b>{title}</b> › 消息检测\n\n敏感词: {status}\n链接/@引流: {msg_link}\n防拼字规避: {norm_status}"
         kb = get_message_menu_keyboard(group_id)
         await callback.message.edit_text(text, reply_markup=kb)
         await callback.answer()
@@ -882,9 +861,29 @@ async def toggle_message(callback: CallbackQuery):
         await callback.answer(f"消息检测: {status}", show_alert=True)
         kb = get_message_menu_keyboard(group_id)
         status_display = "✅" if cfg.get("check_message_keywords") else "❌"
+        msg_link = "✅" if cfg.get("check_message_link", True) else "❌"
         norm_status = "✅" if cfg.get("message_keyword_normalize", True) else "❌"
         breadcrumb = await get_chat_title_safe(callback.bot, group_id)
-        text = f"<b>{breadcrumb}</b> › 消息检测\n\n启用: {status_display}\n防拼字规避: {norm_status}"
+        text = f"<b>{breadcrumb}</b> › 消息检测\n\n敏感词: {status_display}\n链接/@引流: {msg_link}\n防拼字规避: {norm_status}"
+        await callback.message.edit_text(text, reply_markup=kb)
+    except Exception as e:
+        await callback.answer(f"❌ {str(e)}", show_alert=True)
+
+@router.callback_query(F.data.startswith("toggle_message_link:"), F.from_user.id.in_(ADMIN_IDS))
+async def toggle_message_link(callback: CallbackQuery):
+    try:
+        group_id = int(callback.data.split(":", 1)[1])
+        cfg = get_group_config(group_id)
+        cfg["check_message_link"] = not cfg.get("check_message_link", True)
+        await save_config()
+        status = "✅" if cfg["check_message_link"] else "❌"
+        await callback.answer(f"链接/@引流: {status}", show_alert=True)
+        kb = get_message_menu_keyboard(group_id)
+        title = await get_chat_title_safe(callback.bot, group_id)
+        status_display = "✅" if cfg.get("check_message_keywords") else "❌"
+        msg_link = "✅" if cfg.get("check_message_link", True) else "❌"
+        norm_status = "✅" if cfg.get("message_keyword_normalize", True) else "❌"
+        text = f"<b>{title}</b> › 消息检测\n\n敏感词: {status_display}\n链接/@引流: {msg_link}\n防拼字规避: {norm_status}"
         await callback.message.edit_text(text, reply_markup=kb)
     except Exception as e:
         await callback.answer(f"❌ {str(e)}", show_alert=True)
@@ -897,12 +896,13 @@ async def toggle_message_normalize(callback: CallbackQuery):
         cfg["message_keyword_normalize"] = not cfg.get("message_keyword_normalize", True)
         await save_config()
         status = "✅" if cfg["message_keyword_normalize"] else "❌"
-        await callback.answer(f"防拼字规避（忽略空格标点后匹配）: {status}", show_alert=True)
+        await callback.answer(f"防拼字规避: {status}", show_alert=True)
         kb = get_message_menu_keyboard(group_id)
         title = await get_chat_title_safe(callback.bot, group_id)
         status_display = "✅" if cfg.get("check_message_keywords") else "❌"
+        msg_link = "✅" if cfg.get("check_message_link", True) else "❌"
         norm_status = "✅" if cfg.get("message_keyword_normalize", True) else "❌"
-        text = f"<b>{title}</b> › 消息检测\n\n启用: {status_display}\n防拼字规避: {norm_status}"
+        text = f"<b>{title}</b> › 消息检测\n\n敏感词: {status_display}\n链接/@引流: {msg_link}\n防拼字规避: {norm_status}"
         await callback.message.edit_text(text, reply_markup=kb)
     except Exception as e:
         await callback.answer(f"❌ {str(e)}", show_alert=True)
