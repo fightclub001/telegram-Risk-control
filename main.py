@@ -85,10 +85,12 @@ def _default_group_config():
         "check_bio_link": True,
         "bio_keywords": ["qq:", "qq：", "qq号", "加qq", "扣扣", "微信", "wx:", "weixin", "加我微信", "wxid_", "幼女", "萝莉", "少妇", "人妻", "福利", "约炮", "onlyfans", "小红书", "抖音", "纸飞机", "机场", "t.me/", "@"],
         "check_bio_keywords": True,
+        "check_message_link": True,  # 消息内链接/@引流（与简介检测同组）
         "display_keywords": ["加v", "加微信", "加qq", "加扣", "福利加", "约", "约炮", "资源私聊", "私我", "私聊我", "飞机", "纸飞机", "福利", "外围", "反差", "嫩模", "学生妹", "空姐", "人妻", "熟女", "onlyfans", "of", "leak", "nudes", "十八+", "av"],
         "check_display_keywords": True,
         "message_keywords": ["qq:", "qq号", "微信", "wx:", "幼女", "萝莉", "福利", "约炮", "onlyfans"],
         "check_message_keywords": True,
+        "message_keyword_normalize": True,  # 防拼字规避：忽略空格标点后匹配（如 A  bc，D 命中 abcd）
         "short_msg_detection": True,
         "short_msg_threshold": 3,
         "min_consecutive_count": 2,
@@ -423,10 +425,12 @@ def get_bio_menu_keyboard(group_id: int):
     cfg = get_group_config(group_id)
     link_status = "✅" if cfg.get("check_bio_link") else "❌"
     kw_status = "✅" if cfg.get("check_bio_keywords") else "❌"
+    msg_link_status = "✅" if cfg.get("check_message_link", True) else "❌"
     buttons = [
-        [InlineKeyboardButton(text=f"链接 {link_status}", callback_data=f"toggle_bio_link:{group_id}")],
-        [InlineKeyboardButton(text=f"敏感词 {kw_status}", callback_data=f"toggle_bio_keywords:{group_id}")],
-        [InlineKeyboardButton(text="📋 编辑词汇", callback_data=f"edit_bio_kw:{group_id}")],
+        [InlineKeyboardButton(text=f"简介链接 {link_status}", callback_data=f"toggle_bio_link:{group_id}")],
+        [InlineKeyboardButton(text=f"简介敏感词 {kw_status}", callback_data=f"toggle_bio_keywords:{group_id}")],
+        [InlineKeyboardButton(text=f"消息链接/@引流 {msg_link_status}", callback_data=f"toggle_message_link:{group_id}")],
+        [InlineKeyboardButton(text="📋 编辑简介词汇", callback_data=f"edit_bio_kw:{group_id}")],
         [InlineKeyboardButton(text="👀 查看", callback_data=f"view_bio_kw:{group_id}")],
         [InlineKeyboardButton(text="⬅️ 返回", callback_data=f"group_menu:{group_id}")],
     ]
@@ -446,8 +450,10 @@ def get_display_menu_keyboard(group_id: int):
 def get_message_menu_keyboard(group_id: int):
     cfg = get_group_config(group_id)
     status = "✅" if cfg.get("check_message_keywords") else "❌"
+    norm_status = "✅" if cfg.get("message_keyword_normalize", True) else "❌"
     buttons = [
         [InlineKeyboardButton(text=f"启用 {status}", callback_data=f"toggle_message:{group_id}")],
+        [InlineKeyboardButton(text=f"防拼字规避 {norm_status}", callback_data=f"toggle_message_normalize:{group_id}")],
         [InlineKeyboardButton(text="📋 编辑词汇", callback_data=f"edit_message_kw:{group_id}")],
         [InlineKeyboardButton(text="👀 查看", callback_data=f"view_message_kw:{group_id}")],
         [InlineKeyboardButton(text="⬅️ 返回", callback_data=f"group_menu:{group_id}")],
@@ -657,10 +663,30 @@ async def bio_submenu(callback: CallbackQuery):
         cfg = get_group_config(group_id)
         link_status = "✅" if cfg.get("check_bio_link") else "❌"
         kw_status = "✅" if cfg.get("check_bio_keywords") else "❌"
-        text = f"<b>{title}</b> › 简介检测\n\n链接: {link_status}\n敏感词: {kw_status}"
+        msg_link = "✅" if cfg.get("check_message_link", True) else "❌"
+        text = f"<b>{title}</b> › 简介与引流检测\n\n简介链接: {link_status}\n简介敏感词: {kw_status}\n消息链接/@引流: {msg_link}"
         kb = get_bio_menu_keyboard(group_id)
         await callback.message.edit_text(text, reply_markup=kb)
         await callback.answer()
+    except Exception as e:
+        await callback.answer(f"❌ {str(e)}", show_alert=True)
+
+@router.callback_query(F.data.startswith("toggle_message_link:"), F.from_user.id.in_(ADMIN_IDS))
+async def toggle_message_link(callback: CallbackQuery):
+    try:
+        group_id = int(callback.data.split(":", 1)[1])
+        cfg = get_group_config(group_id)
+        cfg["check_message_link"] = not cfg.get("check_message_link", True)
+        await save_config()
+        status = "✅" if cfg["check_message_link"] else "❌"
+        await callback.answer(f"消息链接/@引流: {status}", show_alert=True)
+        kb = get_bio_menu_keyboard(group_id)
+        title = await get_chat_title_safe(callback.bot, group_id)
+        link_status = "✅" if cfg.get("check_bio_link") else "❌"
+        kw_status = "✅" if cfg.get("check_bio_keywords") else "❌"
+        msg_link = "✅" if cfg.get("check_message_link", True) else "❌"
+        text = f"<b>{title}</b> › 简介与引流检测\n\n简介链接: {link_status}\n简介敏感词: {kw_status}\n消息链接/@引流: {msg_link}"
+        await callback.message.edit_text(text, reply_markup=kb)
     except Exception as e:
         await callback.answer(f"❌ {str(e)}", show_alert=True)
 
@@ -672,12 +698,13 @@ async def toggle_bio_link(callback: CallbackQuery):
         cfg["check_bio_link"] = not cfg.get("check_bio_link", True)
         await save_config()
         status = "✅" if cfg["check_bio_link"] else "❌"
-        await callback.answer(f"链接检测: {status}", show_alert=True)
+        await callback.answer(f"简介链接: {status}", show_alert=True)
         kb = get_bio_menu_keyboard(group_id)
         link_status = "✅" if cfg.get("check_bio_link") else "❌"
         kw_status = "✅" if cfg.get("check_bio_keywords") else "❌"
+        msg_link = "✅" if cfg.get("check_message_link", True) else "❌"
         breadcrumb = await get_chat_title_safe(callback.bot, group_id)
-        text = f"<b>{breadcrumb}</b> › 简介检测\n\n链接: {link_status}\n敏感词: {kw_status}"
+        text = f"<b>{breadcrumb}</b> › 简介与引流检测\n\n简介链接: {link_status}\n简介敏感词: {kw_status}\n消息链接/@引流: {msg_link}"
         await callback.message.edit_text(text, reply_markup=kb)
     except Exception as e:
         await callback.answer(f"❌ {str(e)}", show_alert=True)
@@ -690,12 +717,13 @@ async def toggle_bio_keywords(callback: CallbackQuery):
         cfg["check_bio_keywords"] = not cfg.get("check_bio_keywords", True)
         await save_config()
         status = "✅" if cfg["check_bio_keywords"] else "❌"
-        await callback.answer(f"敏感词检测: {status}", show_alert=True)
+        await callback.answer(f"简介敏感词: {status}", show_alert=True)
         kb = get_bio_menu_keyboard(group_id)
         link_status = "✅" if cfg.get("check_bio_link") else "❌"
         kw_status = "✅" if cfg.get("check_bio_keywords") else "❌"
+        msg_link = "✅" if cfg.get("check_message_link", True) else "❌"
         breadcrumb = await get_chat_title_safe(callback.bot, group_id)
-        text = f"<b>{breadcrumb}</b> › 简介检测\n\n链接: {link_status}\n敏感词: {kw_status}"
+        text = f"<b>{breadcrumb}</b> › 简介与引流检测\n\n简介链接: {link_status}\n简介敏感词: {kw_status}\n消息链接/@引流: {msg_link}"
         await callback.message.edit_text(text, reply_markup=kb)
     except Exception as e:
         await callback.answer(f"❌ {str(e)}", show_alert=True)
@@ -835,7 +863,8 @@ async def message_submenu(callback: CallbackQuery):
         title = await get_chat_title_safe(callback.bot, group_id)
         cfg = get_group_config(group_id)
         status = "✅" if cfg.get("check_message_keywords") else "❌"
-        text = f"<b>{title}</b> › 消息检测: {status}"
+        norm_status = "✅" if cfg.get("message_keyword_normalize", True) else "❌"
+        text = f"<b>{title}</b> › 消息检测\n\n启用: {status}\n防拼字规避（忽略空格标点匹配）: {norm_status}"
         kb = get_message_menu_keyboard(group_id)
         await callback.message.edit_text(text, reply_markup=kb)
         await callback.answer()
@@ -853,8 +882,27 @@ async def toggle_message(callback: CallbackQuery):
         await callback.answer(f"消息检测: {status}", show_alert=True)
         kb = get_message_menu_keyboard(group_id)
         status_display = "✅" if cfg.get("check_message_keywords") else "❌"
+        norm_status = "✅" if cfg.get("message_keyword_normalize", True) else "❌"
         breadcrumb = await get_chat_title_safe(callback.bot, group_id)
-        text = f"<b>{breadcrumb}</b> › 消息检测: {status_display}"
+        text = f"<b>{breadcrumb}</b> › 消息检测\n\n启用: {status_display}\n防拼字规避: {norm_status}"
+        await callback.message.edit_text(text, reply_markup=kb)
+    except Exception as e:
+        await callback.answer(f"❌ {str(e)}", show_alert=True)
+
+@router.callback_query(F.data.startswith("toggle_message_normalize:"), F.from_user.id.in_(ADMIN_IDS))
+async def toggle_message_normalize(callback: CallbackQuery):
+    try:
+        group_id = int(callback.data.split(":", 1)[1])
+        cfg = get_group_config(group_id)
+        cfg["message_keyword_normalize"] = not cfg.get("message_keyword_normalize", True)
+        await save_config()
+        status = "✅" if cfg["message_keyword_normalize"] else "❌"
+        await callback.answer(f"防拼字规避（忽略空格标点后匹配）: {status}", show_alert=True)
+        kb = get_message_menu_keyboard(group_id)
+        title = await get_chat_title_safe(callback.bot, group_id)
+        status_display = "✅" if cfg.get("check_message_keywords") else "❌"
+        norm_status = "✅" if cfg.get("message_keyword_normalize", True) else "❌"
+        text = f"<b>{title}</b> › 消息检测\n\n启用: {status_display}\n防拼字规避: {norm_status}"
         await callback.message.edit_text(text, reply_markup=kb)
     except Exception as e:
         await callback.answer(f"❌ {str(e)}", show_alert=True)
@@ -915,7 +963,11 @@ async def short_submenu(callback: CallbackQuery):
         cfg = get_group_config(group_id)
         short_enabled = "✅" if cfg.get("short_msg_detection") else "❌"
         fill_enabled = "✅" if cfg.get("fill_garbage_detection") else "❌"
-        text = f"<b>{title}</b> › 短消息/垃圾\n\n短消息: {short_enabled}\n垃圾: {fill_enabled}"
+        th = cfg.get("short_msg_threshold", 3)
+        n = cfg.get("min_consecutive_count", 2)
+        w = cfg.get("time_window_seconds", 60)
+        rule = f"连续{n}条字数≤{th}在{w}秒内即触发（防「点」「我」「头」「像」式连发）"
+        text = f"<b>{title}</b> › 短消息/垃圾\n\n短消息: {short_enabled}\n规则: {rule}\n\n垃圾: {fill_enabled}"
         kb = get_short_menu_keyboard(group_id)
         await callback.message.edit_text(text, reply_markup=kb)
         await callback.answer()
@@ -1870,6 +1922,14 @@ async def view_status(callback: CallbackQuery):
 
 # ==================== 检测和回复核心逻辑 ====================
 FILL_CHARS = set(r" .,，。！？*\\\~`-_=+[]{}()\"'\\|\n\t\r　")
+# 防拼字规避：去掉空格、常见标点后匹配敏感词（如 A  bc，D 命中 abcd）
+KEYWORD_NORMALIZE_CHARS = set(" .,，。！？、；：\"'（）【】\n\t\r　*_~`-+=|")
+
+def _normalize_for_keyword(text: str) -> str:
+    """去掉空格和常见标点、转小写，用于防拼字规避匹配"""
+    if not text:
+        return ""
+    return "".join(c for c in text.lower() if c not in KEYWORD_NORMALIZE_CHARS)
 
 user_short_msg_history = {}
 
@@ -2318,38 +2378,55 @@ async def detect_and_warn(message: Message):
     except Exception:
         pass
     
+    # 2b. 消息内链接/@引流（与简介检测同组、同触发模式）
+    if cfg.get("check_message_link", True) and message.text:
+        msg_lower = message.text.lower()
+        if any(x in msg_lower for x in ["http://", "https://", "t.me/"]) or "@" in message.text:
+            triggers.append("消息链接/@引流")
+    
     # 3. 名称敏感词
     if cfg.get("check_display_keywords", True):
         display_name = (message.from_user.full_name or "").lower()
         if any(kw.lower() in display_name for kw in cfg.get("display_keywords", [])):
             triggers.append("昵称词汇")
     
-    # 4. 消息敏感词
-    if cfg.get("check_message_keywords", True):
+    # 4. 消息敏感词（可选防拼字：忽略空格标点后匹配）
+    if cfg.get("check_message_keywords", True) and message.text:
+        use_normalize = cfg.get("message_keyword_normalize", True)
         text_lower = message.text.lower()
+        text_to_match = _normalize_for_keyword(message.text) if use_normalize else text_lower
         for kw in cfg.get("message_keywords", []):
-            if kw.lower() in text_lower:
-                triggers.append("内容词汇")
-                break
+            if not kw:
+                continue
+            kw_lower = kw.lower()
+            if use_normalize:
+                kw_norm = _normalize_for_keyword(kw_lower)
+                if kw_norm and kw_norm in text_to_match:
+                    triggers.append("内容词汇")
+                    break
+            else:
+                if kw_lower in text_lower:
+                    triggers.append("内容词汇")
+                    break
     
-    # 5. 连续极短消息（按群+用户统计，避免跨群误判）
-    if cfg.get("short_msg_detection", True):
+    # 5. 连续极短消息（防「点」「我」「头」「像」式一字一条连发规避；按群+用户统计）
+    if cfg.get("short_msg_detection", True) and message.text is not None:
+        th = cfg.get("short_msg_threshold", 3)
+        n_consec = cfg.get("min_consecutive_count", 2)
+        window_sec = cfg.get("time_window_seconds", 60)
         text_len = len(message.text)
-        if text_len <= cfg.get("short_msg_threshold", 3):
+        if text_len <= th:
             short_key = (group_id, user_id)
             if short_key not in user_short_msg_history:
                 user_short_msg_history[short_key] = deque(maxlen=15)
-            
             history = user_short_msg_history[short_key]
             now = time.time()
-            while history and now - history[0][0] > cfg.get("time_window_seconds", 60):
+            while history and now - history[0][0] > window_sec:
                 history.popleft()
             history.append((now, message.text))
-            
-            recent = list(history)[-cfg.get("min_consecutive_count", 2):]
-            if len(recent) >= cfg.get("min_consecutive_count", 2):
-                if all(len(t.strip()) <= cfg.get("short_msg_threshold", 3) for _, t in recent):
-                    triggers.append("连续短消息")
+            recent = list(history)[-n_consec:]
+            if len(recent) >= n_consec and all(len((t or "").strip()) <= th for _, t in recent):
+                triggers.append("连续短消息")
     
     # 6. 垃圾填充
     if cfg.get("fill_garbage_detection", True):
