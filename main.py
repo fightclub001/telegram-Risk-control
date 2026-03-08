@@ -53,8 +53,9 @@ reports = {}
 lock = asyncio.Lock()
 user_violations = {}
 config = {}
-# 媒体权限统计：发言数、同条超过10次不计数、已解锁、助力数（持久化）
+# 媒体权限统计：合规消息数、同条超过10次不计数、已解锁名单、助力数（持久化到 MEDIA_STATS_FILE，重新部署须保留 DATA_DIR 卷）
 media_stats = {"message_counts": {}, "text_counts": {}, "unlocked": {}, "boosts": {}}
+media_stats_loaded = False
 # 媒体消息举报/点赞（内存即可，按消息维度）
 media_reports = {}
 media_reports_lock = asyncio.Lock()
@@ -151,7 +152,8 @@ async def save_user_violations():
         print(f"违规记录保存失败: {e}")
 
 async def load_media_stats():
-    global media_stats
+    global media_stats, media_stats_loaded
+    media_stats_loaded = False
     try:
         if os.path.exists(MEDIA_STATS_FILE):
             with open(MEDIA_STATS_FILE, "r", encoding="utf-8") as f:
@@ -162,10 +164,14 @@ async def load_media_stats():
                 "unlocked": data.get("unlocked", {}),
                 "boosts": data.get("boosts", {}),
             }
+        media_stats_loaded = True
     except Exception as e:
-        print(f"媒体统计加载失败: {e}")
+        print(f"媒体统计加载失败: {e}（本次运行不写入，避免覆盖磁盘原有数据）")
 
 async def save_media_stats():
+    global media_stats_loaded
+    if not media_stats_loaded:
+        return
     try:
         with open(MEDIA_STATS_FILE, "w", encoding="utf-8") as f:
             json.dump(media_stats, f, ensure_ascii=False, indent=2)
