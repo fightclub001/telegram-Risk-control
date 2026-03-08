@@ -41,23 +41,79 @@ router = Router()
 dp.include_router(router)
 
 # ==================== 数据文件 ====================
-os.makedirs("/data", exist_ok=True)
-DATA_FILE = "/data/reports.json"
-CONFIG_FILE = "/data/config.json"
-USER_VIOLATIONS_FILE = "/data/user_violations.json"
+# 使用环境变量 DATA_DIR；Railway 需将 Volume 挂载到该路径（如 /data），重新部署后配置与关键词才不丢失
+DATA_DIR = os.getenv("DATA_DIR", "/data")
+os.makedirs(DATA_DIR, exist_ok=True)
+DATA_FILE = os.path.join(DATA_DIR, "reports.json")
+CONFIG_FILE = os.path.join(DATA_DIR, "config.json")
+USER_VIOLATIONS_FILE = os.path.join(DATA_DIR, "user_violations.json")
+MEDIA_STATS_FILE = os.path.join(DATA_DIR, "media_stats.json")
 
 reports = {}
 lock = asyncio.Lock()
 user_violations = {}
 config = {}
+# 媒体权限统计：发言数、同条超过10次不计数、已解锁、助力数（持久化）
+media_stats = {"message_counts": {}, "text_counts": {}, "unlocked": {}, "boosts": {}}
+# 媒体消息举报/点赞（内存即可，按消息维度）
+media_reports = {}
+media_reports_lock = asyncio.Lock()
+# 举报按钮限流：连续两条媒体 20 分钟；一天超过 3 次当天失效
+MEDIA_REPORT_COOLDOWN_SEC = 20 * 60
+MEDIA_REPORT_MAX_PER_DAY = 3
+media_report_last = {}  # (uid,) -> (msg_id, time) 最近一次举报的媒体
+media_report_day_count = {}  # (uid, date_str) -> count
+MEDIA_UNLOCK_MSG_COUNT = 50
+MEDIA_UNLOCK_BOOSTS = 4
 
 # ==================== 配置函数 ====================
+def _default_group_config():
+    """单群默认配置（关键词等会随管理员编辑持久化到 CONFIG_FILE）"""
+    return {
+        "enabled": True,
+        "check_bio_link": True,
+        "bio_keywords": ["qq:", "qq：", "qq号", "加qq", "扣扣", "微信", "wx:", "weixin", "加我微信", "wxid_", "幼女", "萝莉", "少妇", "人妻", "福利", "约炮", "onlyfans", "小红书", "抖音", "纸飞机", "机场", "t.me/", "@"],
+        "check_bio_keywords": True,
+        "display_keywords": ["加v", "加微信", "加qq", "加扣", "福利加", "约", "约炮", "资源私聊", "私我", "私聊我", "飞机", "纸飞机", "福利", "外围", "反差", "嫩模", "学生妹", "空姐", "人妻", "熟女", "onlyfans", "of", "leak", "nudes", "十八+", "av"],
+        "check_display_keywords": True,
+        "message_keywords": ["qq:", "qq号", "微信", "wx:", "幼女", "萝莉", "福利", "约炮", "onlyfans"],
+        "check_message_keywords": True,
+        "short_msg_detection": True,
+        "short_msg_threshold": 3,
+        "min_consecutive_count": 2,
+        "time_window_seconds": 60,
+        "fill_garbage_detection": True,
+        "fill_garbage_min_raw_len": 12,
+        "fill_garbage_max_clean_len": 8,
+        "fill_space_ratio": 0.30,
+        "violation_mute_hours": 1,
+        "reported_message_threshold": 2,
+        "autoreply": {
+            "enabled": False,
+            "keywords": [],
+            "reply_text": "",
+            "buttons": [],
+            "delete_user_sec": 0,
+            "delete_bot_sec": 0
+        },
+        "exempt_users": {}
+    }
+
 async def load_config():
     global config
     try:
         if os.path.exists(CONFIG_FILE):
             with open(CONFIG_FILE, "r", encoding="utf-8") as f:
                 config = json.load(f)
+            # 合并默认值，保证新增配置项有默认值且已保存的关键词等不丢失
+            if "groups" not in config:
+                config["groups"] = {}
+            for gid, saved in list(config["groups"].items()):
+                default = _default_group_config()
+                for k, v in default.items():
+                    if k not in saved:
+                        saved[k] = v
+                config["groups"][gid] = saved
         else:
             config = {"groups": {}}
             await save_config()
@@ -88,38 +144,64 @@ async def save_user_violations():
     except Exception as e:
         print(f"违规记录保存失败: {e}")
 
+async def load_media_stats():
+    global media_stats
+    try:
+        if os.path.exists(MEDIA_STATS_FILE):
+            with open(MEDIA_STATS_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            media_stats = {
+                "message_counts": data.get("message_counts", {}),
+                "text_counts": data.get("text_counts", {}),
+                "unlocked": data.get("unlocked", {}),
+                "boosts": data.get("boosts", {}),
+            }
+    except Exception as e:
+        print(f"媒体统计加载失败: {e}")
+
+async def save_media_stats():
+    try:
+        with open(MEDIA_STATS_FILE, "w", encoding="utf-8") as f:
+            json.dump(media_stats, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"媒体统计保存失败: {e}")
+
+def _media_key(group_id: int, user_id: int) -> str:
+    return f"{group_id}_{user_id}"
+
+def _can_send_media(group_id: int, user_id: int, is_premium: bool) -> bool:
+    """是否已解锁发媒体：50 条合规消息 / 会员 / 助力 4 次"""
+    key = _media_key(group_id, user_id)
+    if media_stats["unlocked"].get(key):
+        return True
+    if is_premium:
+        return True
+    if media_stats["boosts"].get(key, 0) >= MEDIA_UNLOCK_BOOSTS:
+        return True
+    return False
+
+async def _increment_media_count(group_id: int, user_id: int, normalized_text: str) -> bool:
+    """合规消息计数（同一条超过 10 次不计数）。返回是否因本次达到 50 而刚解锁。"""
+    key = _media_key(group_id, user_id)
+    if media_stats["unlocked"].get(key):
+        return False
+    tc = media_stats["text_counts"].setdefault(key, {})
+    if tc.get(normalized_text, 0) >= 10:
+        return False
+    tc[normalized_text] = tc.get(normalized_text, 0) + 1
+    count = media_stats["message_counts"].get(key, 0) + 1
+    media_stats["message_counts"][key] = count
+    if count >= MEDIA_UNLOCK_MSG_COUNT:
+        media_stats["unlocked"][key] = True
+        await save_media_stats()
+        return True
+    await save_media_stats()
+    return False
+
 def get_group_config(group_id: int):
     gid = str(group_id)
     if gid not in config["groups"]:
-        config["groups"][gid] = {
-            "enabled": True,
-            "check_bio_link": True,
-            "bio_keywords": ["qq:", "qq：", "qq号", "加qq", "扣扣", "微信", "wx:", "weixin", "加我微信", "wxid_", "幼女", "萝莉", "少妇", "人妻", "福利", "约炮", "onlyfans", "小红书", "抖音", "纸飞机", "机场", "t.me/", "@"],
-            "check_bio_keywords": True,
-            "display_keywords": ["加v", "加微信", "加qq", "加扣", "福利加", "约", "约炮", "资源私聊", "私我", "私聊我", "飞机", "纸飞机", "福利", "外围", "反差", "嫩模", "学生妹", "空姐", "人妻", "熟女", "onlyfans", "of", "leak", "nudes", "十八+", "av"],
-            "check_display_keywords": True,
-            "message_keywords": ["qq:", "qq号", "微信", "wx:", "幼女", "萝莉", "福利", "约炮", "onlyfans"],
-            "check_message_keywords": True,
-            "short_msg_detection": True,
-            "short_msg_threshold": 3,
-            "min_consecutive_count": 2,
-            "time_window_seconds": 60,
-            "fill_garbage_detection": True,
-            "fill_garbage_min_raw_len": 12,
-            "fill_garbage_max_clean_len": 8,
-            "fill_space_ratio": 0.30,
-            "violation_mute_hours": 1,
-            "reported_message_threshold": 2,
-            "autoreply": {
-                "enabled": False,
-                "keywords": [],
-                "reply_text": "",
-                "buttons": [],
-                "delete_user_sec": 0,
-                "delete_bot_sec": 0
-            },
-            "exempt_users": {}
-        }
+        config["groups"][gid] = _default_group_config()
     return config["groups"][gid]
 
 # ==================== FSM 状态 ====================
@@ -1247,6 +1329,84 @@ def build_warning_buttons(msg_id: int, report_count: int):
     
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
+def _media_reply_buttons(chat_id: int, media_msg_id: int, report_count: int, like_count: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text=f"举报儿童色情⚠️ {report_count}人", callback_data=f"mr:{chat_id}:{media_msg_id}"),
+            InlineKeyboardButton(text=f"点赞👍 {like_count}人", callback_data=f"ml:{chat_id}:{media_msg_id}"),
+        ]
+    ])
+
+def _message_link(chat_id: int, msg_id: int) -> str:
+    """群内消息链接，便于管理员定位"""
+    cid = str(chat_id).replace("-100", "")
+    return f"https://t.me/c/{cid}/{msg_id}"
+
+@router.message(Command("setboost"), F.chat.id.in_(GROUP_IDS), F.reply_to_message, F.from_user.id.in_(ADMIN_IDS))
+async def cmd_set_boost(message: Message):
+    """管理员在群内回复某条消息并发送 /setboost 4，将该用户的群组助力次数设为 4（用于解锁发媒体）"""
+    try:
+        text = (message.text or "").strip().split()
+        if len(text) != 2:
+            await message.reply("用法：回复要设置的用户的消息，发送 /setboost 数字（如 /setboost 4）")
+            return
+        count = int(text[1])
+        if count < 0 or count > 100:
+            await message.reply("助力次数请填 0～100")
+            return
+        target = message.reply_to_message.from_user
+        if not target or target.is_bot:
+            await message.reply("请回复真实用户的消息")
+            return
+        key = _media_key(message.chat.id, target.id)
+        media_stats["boosts"][key] = count
+        await save_media_stats()
+        name = target.full_name or target.username or target.id
+        await message.reply(f"已将该用户在本群的助力次数设为 {count}。{name} 现可发媒体。")
+    except ValueError:
+        await message.reply("请发送数字，如 /setboost 4")
+    except Exception as e:
+        await message.reply(f"设置失败: {e}")
+
+@router.message(F.chat.id.in_(GROUP_IDS), F.photo | F.video | F.voice | F.video_note)
+async def on_media_message(message: Message):
+    """媒体消息：无权限则删除并提示；有权限则回复举报/点赞按钮"""
+    if not message.from_user or message.from_user.is_bot:
+        return
+    cfg = get_group_config(message.chat.id)
+    if not cfg.get("enabled", True):
+        return
+    user_id = message.from_user.id
+    group_id = message.chat.id
+    is_premium = False
+    try:
+        mem = await bot.get_chat_member(group_id, user_id)
+        is_premium = getattr(mem, "is_premium", False) or False
+    except Exception:
+        pass
+    if not _can_send_media(group_id, user_id, is_premium):
+        try:
+            await message.delete()
+        except Exception:
+            pass
+        name = _get_display_name_from_message(message, user_id)
+        await bot.send_message(
+            group_id,
+            f"⚠️ {name} 尚未解锁发媒体权限。\n"
+            f"发送「权限」可查看进度；满 {MEDIA_UNLOCK_MSG_COUNT} 条合规消息或 Telegram 会员或为群组助力 {MEDIA_UNLOCK_BOOSTS} 次即可解锁。"
+        )
+        return
+    reply = await message.reply("📎 媒体消息", reply_markup=_media_reply_buttons(group_id, message.message_id, 0, 0))
+    async with media_reports_lock:
+        media_reports[(group_id, message.message_id)] = {
+            "chat_id": group_id,
+            "media_msg_id": message.message_id,
+            "reply_msg_id": reply.message_id,
+            "reporters": set(),
+            "likes": set(),
+            "deleted": False,
+        }
+
 @router.message(F.chat.id.in_(GROUP_IDS), F.text)
 async def detect_and_warn(message: Message):
     """发言时检测并发送警告"""
@@ -1259,6 +1419,36 @@ async def detect_and_warn(message: Message):
     
     user_id = message.from_user.id
     group_id = message.chat.id
+
+    # 「权限」查询发媒体进度
+    if message.text and message.text.strip() == "权限":
+        key = _media_key(group_id, user_id)
+        count = media_stats["message_counts"].get(key, 0)
+        unlocked = media_stats["unlocked"].get(key, False)
+        boosts = media_stats["boosts"].get(key, 0)
+        is_premium = False
+        try:
+            mem = await bot.get_chat_member(group_id, user_id)
+            is_premium = getattr(mem, "is_premium", False) or False
+        except Exception:
+            pass
+        if unlocked:
+            await message.reply(f"✅ 你已解锁在本群直接发送图片/视频/语音（合规消息已满 {MEDIA_UNLOCK_MSG_COUNT} 条）。")
+            return
+        if is_premium:
+            await message.reply("✅ 你已具备发媒体权限（Telegram 会员）。")
+            return
+        if boosts >= MEDIA_UNLOCK_BOOSTS:
+            await message.reply(f"✅ 你已解锁发媒体权限（已为群组助力 {boosts} 次）。")
+            return
+        await message.reply(
+            f"📊 发媒体权限进度\n"
+            f"· 合规消息：{count}/{MEDIA_UNLOCK_MSG_COUNT}（满 50 条可解锁）\n"
+            f"· 群组助力：{boosts}/{MEDIA_UNLOCK_BOOSTS}（满 4 次可解锁）\n"
+            f"· Telegram 会员：{'是' if is_premium else '否'}\n"
+            f"（刷屏、重复发言、短消息等不计入合规消息）"
+        )
+        return
     
     # 重复发言检测（优先执行）
     if await handle_repeat_message(message):
@@ -1460,6 +1650,23 @@ async def detect_and_warn(message: Message):
                     pass
         except Exception as e:
             print(f"通知管理员失败: {e}")
+    else:
+        # 合规消息：计入媒体权限进度（同一条超过 10 次不计数）
+        try:
+            norm = _normalize_text(message.text or "")
+            if norm:
+                just_unlocked = await _increment_media_count(group_id, user_id, norm)
+                if just_unlocked:
+                    name = _get_display_name_from_message(message, user_id)
+                    try:
+                        await bot.send_message(
+                            group_id,
+                            f"🎉 {name} 已在本群发送合规消息满 {MEDIA_UNLOCK_MSG_COUNT} 条，解锁直接发送图片/视频/语音的权限。"
+                        )
+                    except Exception:
+                        pass
+        except Exception as e:
+            print(f"媒体计数失败: {e}")
 
 @router.callback_query(F.data.startswith("admin_ban:"))
 async def handle_admin_ban(callback: CallbackQuery):
@@ -1662,6 +1869,156 @@ async def handle_exempt(callback: CallbackQuery):
         print("豁免异常:", e)
         await callback.answer("❌ 失败", show_alert=True)
 
+@router.callback_query(F.data.startswith("mr:"))
+async def handle_media_report(callback: CallbackQuery):
+    """举报儿童色情：限流 20 分钟连续两条、一天超过 3 次失效"""
+    try:
+        parts = callback.data.split(":", 2)
+        if len(parts) != 3:
+            await callback.answer("无效", show_alert=True)
+            return
+        chat_id = int(parts[1])
+        media_msg_id = int(parts[2])
+        uid = callback.from_user.id
+        now = time.time()
+        day_key = (uid, time.strftime("%Y-%m-%d", time.localtime(now)))
+
+        # 一天超过 3 次：本次不计数，提示联系管理员
+        day_count = media_report_day_count.get(day_key, 0)
+        if day_count >= MEDIA_REPORT_MAX_PER_DAY:
+            await callback.answer("今日举报次数已达上限，如有问题请直接联系管理员。", show_alert=True)
+            return
+
+        # 连续两条媒体 20 分钟内：不计数
+        last = media_report_last.get(uid)
+        if last:
+            last_mid, last_ts = last
+            if last_mid != media_msg_id and (now - last_ts) < MEDIA_REPORT_COOLDOWN_SEC:
+                await callback.answer("请勿在 20 分钟内对多条媒体连续举报，请稍后再试。", show_alert=True)
+                return
+        media_report_last[uid] = (media_msg_id, now)
+        media_report_day_count[day_key] = day_count + 1
+
+        async with media_reports_lock:
+            key = (chat_id, media_msg_id)
+            if key not in media_reports:
+                await callback.answer("已过期")
+                return
+            data = media_reports[key]
+            if data["deleted"]:
+                await callback.answer("该媒体已被删除")
+                return
+            if uid in data["reporters"]:
+                await callback.answer("已举报过")
+                return
+            data["reporters"].add(uid)
+            report_count = len(data["reporters"])
+            like_count = len(data["likes"])
+            reply_id = data["reply_msg_id"]
+
+        try:
+            await bot.edit_message_reply_markup(
+                chat_id=chat_id,
+                message_id=reply_id,
+                reply_markup=_media_reply_buttons(chat_id, media_msg_id, report_count, like_count)
+            )
+        except Exception:
+            pass
+        await callback.answer()
+
+        if report_count == 3:
+            try:
+                await bot.delete_message(chat_id, media_msg_id)
+            except Exception:
+                pass
+            try:
+                await bot.edit_message_text(
+                    chat_id=chat_id,
+                    message_id=reply_id,
+                    text="⚠️ 多人举报，已删除该媒体。",
+                    reply_markup=None
+                )
+            except Exception:
+                pass
+            async with media_reports_lock:
+                if key in media_reports:
+                    media_reports[key]["deleted"] = True
+        elif report_count == 2:
+            link = _message_link(chat_id, media_msg_id)
+            for admin_id in ADMIN_IDS:
+                try:
+                    await bot.send_message(
+                        admin_id,
+                        f"⚠️ 群内媒体被举报（儿童色情相关）\n群: {chat_id}\n消息: {link}\n当前举报人数: 2 人",
+                        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                            [InlineKeyboardButton(text="定位到消息", url=link)]
+                        ])
+                except Exception:
+                    pass
+    except Exception as e:
+        print("媒体举报异常:", e)
+        await callback.answer("❌ 失败", show_alert=True)
+
+@router.callback_query(F.data.startswith("ml:"))
+async def handle_media_like(callback: CallbackQuery):
+    """点赞"""
+    try:
+        parts = callback.data.split(":", 2)
+        if len(parts) != 3:
+            await callback.answer("无效", show_alert=True)
+            return
+        chat_id = int(parts[1])
+        media_msg_id = int(parts[2])
+        uid = callback.from_user.id
+        async with media_reports_lock:
+            key = (chat_id, media_msg_id)
+            if key not in media_reports:
+                await callback.answer("已过期")
+                return
+            data = media_reports[key]
+            if uid in data["likes"]:
+                await callback.answer("已点赞过")
+                return
+            data["likes"].add(uid)
+            like_count = len(data["likes"])
+            reply_id = data["reply_msg_id"]
+            report_count = len(data["reporters"])
+        try:
+            await bot.edit_message_reply_markup(
+                chat_id=chat_id,
+                message_id=reply_id,
+                reply_markup=_media_reply_buttons(chat_id, media_msg_id, report_count, like_count)
+            )
+        except Exception:
+            pass
+        await callback.answer()
+    except Exception as e:
+        print("媒体点赞异常:", e)
+        await callback.answer("❌ 失败", show_alert=True)
+
+def _media_rules_text() -> str:
+    return (
+        "📋 本群发媒体（图片/视频/语音）规则\n\n"
+        f"· 合规消息满 {MEDIA_UNLOCK_MSG_COUNT} 条可解锁发媒体\n"
+        f"· 为群组助力 {MEDIA_UNLOCK_BOOSTS} 次可解锁\n"
+        "· Telegram 会员可直接发送\n"
+        "· 刷屏、重复发言、短消息等不计入合规条数\n\n"
+        "发送「权限」可随时查询自己的进度。"
+    )
+
+async def broadcast_media_rules_every_2h():
+    """每 2 小时向各群发送一次媒体权限规则"""
+    while True:
+        await asyncio.sleep(2 * 3600)
+        for gid in GROUP_IDS:
+            try:
+                cfg = get_group_config(gid)
+                if not cfg.get("enabled", True):
+                    continue
+                await bot.send_message(gid, _media_rules_text())
+            except Exception as e:
+                print(f"广播媒体规则失败 {gid}: {e}")
+
 async def cleanup_deleted_messages():
     """清理已删除的消息记录"""
     while True:
@@ -1678,11 +2035,8 @@ async def cleanup_deleted_messages():
                 )
                 await bot.delete_message(list(ADMIN_IDS)[0], test_msg.message_id)
             except TelegramBadRequest:
-                try:
-                    await bot.delete_message(data["chat_id"], data["warning_id"])
-                    to_remove.append(msg_id)
-                except Exception:
-                    pass
+                # 仅从内存移除记录，不删除机器人警告消息，保证群内警告始终保留
+                to_remove.append(msg_id)
         if to_remove:
             async with lock:
                 for oid in to_remove:
@@ -1695,7 +2049,9 @@ async def main():
     await load_config()
     await load_data()
     await load_user_violations()
+    await load_media_stats()
     asyncio.create_task(cleanup_deleted_messages())
+    asyncio.create_task(broadcast_media_rules_every_2h())
     await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
 
 if __name__ == "__main__":
