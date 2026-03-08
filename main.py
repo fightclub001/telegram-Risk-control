@@ -2465,7 +2465,11 @@ async def detect_and_warn(message: Message):
             await message.delete()
         except Exception:
             pass
-        await message.reply("违规引流")
+        # 删除后无法 reply 原消息，用 answer 发一条新消息，避免 TelegramBadRequest: message to be replied not found
+        try:
+            await message.answer("违规引流")
+        except Exception:
+            pass
         if triggers == ["消息链接/@引流"]:
             return
     
