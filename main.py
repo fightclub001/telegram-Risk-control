@@ -1953,6 +1953,7 @@ async def handle_media_report(callback: CallbackQuery):
                         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
                             [InlineKeyboardButton(text="定位到消息", url=link)]
                         ])
+                    )
                 except Exception:
                     pass
     except Exception as e:
