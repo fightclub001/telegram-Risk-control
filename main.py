@@ -3188,16 +3188,13 @@ async def handle_ban(callback: CallbackQuery):
         except Exception:
             pass
 
-        # 上一条已处理的封禁警告消息 15 秒后删除
+        # 上一条已处理的封禁警告消息立即删除
         prev_warning = last_ban_warning_msg.get(group_id)
         if prev_warning:
-            async def _delayed_delete_prev(chat_id: int, mid: int):
-                await asyncio.sleep(15)
-                try:
-                    await bot.delete_message(chat_id, mid)
-                except Exception:
-                    pass
-            asyncio.create_task(_delayed_delete_prev(group_id, prev_warning))
+            try:
+                await bot.delete_message(group_id, prev_warning)
+            except Exception:
+                pass
         last_ban_warning_msg[group_id] = warning_id
 
         await callback.answer(f"✅ {ban_type}")
