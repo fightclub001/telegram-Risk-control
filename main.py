@@ -2473,11 +2473,9 @@ async def detect_and_warn(message: Message):
     group_id = message.chat.id
     _track_user_message(group_id, user_id, message.message_id)
 
-    # 豁免：仅指管理员点击「误判」后加入的白名单，豁免多层内容检测
+    # 误判豁免：仅不做多层内容检测，举报阈值/外部引用/5.1/重复等检测仍执行
     misjudge_wl = cfg.get("misjudge_whitelist") or []
-    if isinstance(misjudge_wl, list) and str(user_id) in misjudge_wl:
-        await _try_count_media_and_notify(message, group_id, user_id, cfg)
-        return
+    misjudge_exempt = isinstance(misjudge_wl, list) and str(user_id) in misjudge_wl
 
     # 「召唤」：本机器人不做任何动作，由群内其他机器人处理
     if message.text and message.text.strip() == "召唤":
@@ -2596,36 +2594,34 @@ async def detect_and_warn(message: Message):
             print(f"外部引用处罚失败: {e}")
         return
 
-    # 多层内容检测（7 项）
+    # 多层内容检测：误判豁免仅跳过「简介链接、简介词汇、昵称词汇」，其余项所有人均检
     triggers = []
-    bio_exempt = False
-    try:
-        if cfg.get("check_bio_link", True) or cfg.get("check_bio_keywords", True):
-            chat_info = await bot.get_chat(user_id)
-            bio = (chat_info.bio or "").strip()
-            bio_lower = bio.lower()
-            # 简介链接数量≥2 时，不适用「bot+双向」豁免
-            bio_link_count = len(re.findall(r"https?://[^\s]+|t\.me/[^\s]+", bio_lower))
-            if "双向" in bio and "bot" in bio_lower and bio_link_count < 2:
-                bio_exempt = True
-            if not bio_exempt:
-                if cfg.get("check_bio_link", True) and any(x in bio_lower for x in ["http://", "https://", "t.me/", "@"]):
-                    triggers.append("简介链接")
-                if cfg.get("check_bio_keywords", True) and any(kw.lower() in bio_lower for kw in cfg.get("bio_keywords", [])):
-                    triggers.append("简介词汇")
-    except Exception:
-        pass
+    if not misjudge_exempt:
+        bio_exempt = False
+        try:
+            if cfg.get("check_bio_link", True) or cfg.get("check_bio_keywords", True):
+                chat_info = await bot.get_chat(user_id)
+                bio = (chat_info.bio or "").strip()
+                bio_lower = bio.lower()
+                # 简介链接数量≥2 时，不适用「bot+双向」豁免
+                bio_link_count = len(re.findall(r"https?://[^\s]+|t\.me/[^\s]+", bio_lower))
+                if "双向" in bio and "bot" in bio_lower and bio_link_count < 2:
+                    bio_exempt = True
+                if not bio_exempt:
+                    if cfg.get("check_bio_link", True) and any(x in bio_lower for x in ["http://", "https://", "t.me/", "@"]):
+                        triggers.append("简介链接")
+                    if cfg.get("check_bio_keywords", True) and any(kw.lower() in bio_lower for kw in cfg.get("bio_keywords", [])):
+                        triggers.append("简介词汇")
+        except Exception:
+            pass
 
-    if cfg.get("check_message_link", True) and message.text and _message_has_link_or_external_at(message.text):
-        triggers.append("消息链接/@引流")
+        # 3. 名称敏感词
+        if cfg.get("check_display_keywords", True):
+            display_name = (message.from_user.full_name or "").lower()
+            if any(kw.lower() in display_name for kw in cfg.get("display_keywords", [])):
+                triggers.append("昵称词汇")
     
-    # 3. 名称敏感词
-    if cfg.get("check_display_keywords", True):
-        display_name = (message.from_user.full_name or "").lower()
-        if any(kw.lower() in display_name for kw in cfg.get("display_keywords", [])):
-            triggers.append("昵称词汇")
-    
-    # 4. 消息敏感词（可选防拼字：忽略空格标点后匹配）
+    # 4. 消息敏感词（可选防拼字：忽略空格标点后匹配）- 误判白名单也检
     if cfg.get("check_message_keywords", True) and message.text:
         use_normalize = cfg.get("message_keyword_normalize", True)
         text_lower = message.text.lower()
@@ -2644,7 +2640,7 @@ async def detect_and_warn(message: Message):
                     triggers.append("内容词汇")
                     break
     
-    # 5. 连续极短消息（防「点」「我」「头」「像」式一字一条连发规避；按群+用户统计）
+    # 5. 连续极短消息 - 误判白名单也检
     if cfg.get("short_msg_detection", True) and message.text is not None:
         th = cfg.get("short_msg_threshold", 3)
         n_consec = cfg.get("min_consecutive_count", 2)
@@ -2663,7 +2659,7 @@ async def detect_and_warn(message: Message):
             if len(recent) >= n_consec and all(len((t or "").strip()) <= th for _, t in recent):
                 triggers.append("连续短消息")
     
-    # 6. 垃圾填充
+    # 6. 垃圾填充 - 误判白名单也检
     if cfg.get("fill_garbage_detection", True):
         text_len = len(message.text)
         if text_len >= cfg.get("fill_garbage_min_raw_len", 12):
@@ -2672,6 +2668,10 @@ async def detect_and_warn(message: Message):
             space_ratio = (message.text.count(" ") + message.text.count("　")) / text_len if text_len > 0 else 0
             if (clean_len <= cfg.get("fill_garbage_max_clean_len", 8)) or (space_ratio >= cfg.get("fill_space_ratio", 0.30)):
                 triggers.append("垃圾填充")
+    
+    # 消息链接/@引流：误判白名单也检，以便 5.1/5.3 仍执行
+    if cfg.get("check_message_link", True) and message.text and _message_has_link_or_external_at(message.text):
+        triggers.append("消息链接/@引流")
     
     # 5.1 消息链接/@引流即时动作：首次禁言1小时，第二次永封（与外部引用一致）
     if "消息链接/@引流" in triggers:
