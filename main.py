@@ -7,7 +7,7 @@ import hashlib
 from collections import deque
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
-from aiogram.enums import ParseMode, ChatMemberStatus
+from aiogram.enums import ParseMode, ChatMemberStatus, ContentType
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, ChatPermissions, ReplyKeyboardRemove
 from aiogram.filters import Command, StateFilter
@@ -57,6 +57,7 @@ CONFIG_FILE = os.path.join(DATA_DIR, "config.json")
 USER_VIOLATIONS_FILE = os.path.join(DATA_DIR, "user_violations.json")
 MEDIA_STATS_FILE = os.path.join(DATA_DIR, "media_stats.json")
 REPEAT_LEVEL_FILE = os.path.join(DATA_DIR, "repeat_levels.json")
+LINK_REF_LEVELS_FILE = os.path.join(DATA_DIR, "link_ref_levels.json")
 
 reports = {}  # key: (group_id, message_id)
 lock = asyncio.Lock()
@@ -64,6 +65,9 @@ user_violations = {}  # key: "gid_uid" -> { msg_id: { "time", "reporters": [] } 
 user_recent_message_ids = {}  # (group_id, user_id) -> deque of (msg_id, time), for 24h delete
 mild_trigger_entries = {}  # (group_id, user_id) -> list of (orig_msg_id, warning_msg_id), max 3
 repeat_warning_msg_id = {}  # (group_id, user_id) -> msg_id of "2次" repeat warning, delete if orig deleted
+# 外部引用 / 消息链接：0=未触发过，1=已触发一次（下次永封）
+external_ref_level = {}  # (group_id, user_id) -> 0|1
+message_link_level = {}  # (group_id, user_id) -> 0|1
 config = {}
 # 媒体权限统计：合规消息数、同条超过10次不计数、已解锁名单、助力数（持久化到 MEDIA_STATS_FILE，重新部署须保留 DATA_DIR 卷）
 media_stats = {"message_counts": {}, "text_counts": {}, "unlocked": {}, "boosts": {}}
@@ -268,6 +272,45 @@ async def save_repeat_levels():
             json.dump(data, f)
     except Exception as e:
         print(f"重复违规级别保存失败: {e}")
+
+
+def load_link_ref_levels():
+    global external_ref_level, message_link_level
+    try:
+        if os.path.exists(LINK_REF_LEVELS_FILE):
+            with open(LINK_REF_LEVELS_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            external_ref_level = {}
+            for k, v in (data.get("external_ref") or {}).items():
+                parts = k.split("_", 1)
+                if len(parts) == 2:
+                    try:
+                        external_ref_level[(int(parts[0]), int(parts[1]))] = int(v)
+                    except ValueError:
+                        pass
+            message_link_level = {}
+            for k, v in (data.get("message_link") or {}).items():
+                parts = k.split("_", 1)
+                if len(parts) == 2:
+                    try:
+                        message_link_level[(int(parts[0]), int(parts[1]))] = int(v)
+                    except ValueError:
+                        pass
+    except Exception as e:
+        print(f"链接/引用级别加载失败: {e}")
+
+
+async def save_link_ref_levels():
+    try:
+        data = {
+            "external_ref": {f"{g}_{u}": v for (g, u), v in external_ref_level.items()},
+            "message_link": {f"{g}_{u}": v for (g, u), v in message_link_level.items()},
+        }
+        with open(LINK_REF_LEVELS_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f)
+    except Exception as e:
+        print(f"链接/引用级别保存失败: {e}")
+
 
 def _media_key(group_id: int, user_id: int) -> str:
     return f"{group_id}_{user_id}"
@@ -2270,7 +2313,7 @@ async def cmd_set_boost(message: Message):
 
 @router.message(F.chat.id.in_(GROUP_IDS), F.photo | F.video | F.voice | F.video_note)
 async def on_media_message(message: Message):
-    """媒体消息：无权限则删除并提示或召唤代发；有权限则回复举报/点赞按钮"""
+    """媒体消息：先检外部引用；无权限则删除并提示；有权限则回复举报/点赞按钮"""
     if not message.from_user or message.from_user.is_bot:
         return
     cfg = get_group_config(message.chat.id)
@@ -2278,6 +2321,56 @@ async def on_media_message(message: Message):
         return
     user_id = message.from_user.id
     group_id = message.chat.id
+    if _has_external_reference(message):
+        display_name = _get_display_name_from_message(message, user_id)
+        try:
+            await message.delete()
+        except Exception:
+            pass
+        try:
+            await bot.send_message(group_id, f"用户 {display_name} 违规引流。")
+        except Exception:
+            pass
+        level_key = (group_id, user_id)
+        level = external_ref_level.get(level_key, 0)
+        try:
+            if level == 0:
+                until_date = int(time.time()) + 3600
+                await bot.restrict_chat_member(
+                    chat_id=group_id,
+                    user_id=user_id,
+                    permissions=ChatPermissions(
+                        can_send_messages=False,
+                        can_send_media_messages=False,
+                        can_send_polls=False,
+                        can_send_other_messages=False,
+                        can_add_web_page_previews=False,
+                        can_change_info=False,
+                        can_invite_users=False,
+                        can_pin_messages=False
+                    ),
+                    until_date=until_date
+                )
+                external_ref_level[level_key] = 1
+            else:
+                await bot.restrict_chat_member(
+                    chat_id=group_id,
+                    user_id=user_id,
+                    permissions=ChatPermissions(
+                        can_send_messages=False,
+                        can_send_media_messages=False,
+                        can_send_polls=False,
+                        can_send_other_messages=False,
+                        can_add_web_page_previews=False,
+                        can_change_info=False,
+                        can_invite_users=False,
+                        can_pin_messages=False
+                    )
+                )
+            await save_link_ref_levels()
+        except Exception as e:
+            print(f"外部引用处罚失败(媒体): {e}")
+        return
     now = time.time()
     username = message.from_user.username if message.from_user else None
     await _refresh_user_boosts(group_id, user_id)
@@ -2343,6 +2436,30 @@ def _message_has_link_or_external_at(text: str) -> bool:
     mentions = re.findall(r"@(\w+)", text)
     has_external_at = bool(mentions) and any(m.lower() != "trump2028_bot" for m in mentions)
     return has_link or has_external_at
+
+
+def _has_external_reference(message: Message) -> bool:
+    """外部引用：A. 消息为转发 或 B. 回复了转发消息"""
+    if getattr(message, "forward_origin", None) is not None:
+        return True
+    if getattr(message, "forward_from", None) is not None:
+        return True
+    if getattr(message, "forward_from_chat", None) is not None:
+        return True
+    if getattr(message, "forward_sender_name", None) is not None:
+        return True
+    reply = getattr(message, "reply_to_message", None)
+    if not reply:
+        return False
+    if getattr(reply, "forward_origin", None) is not None:
+        return True
+    if getattr(reply, "forward_from", None) is not None:
+        return True
+    if getattr(reply, "forward_from_chat", None) is not None:
+        return True
+    if getattr(reply, "forward_sender_name", None) is not None:
+        return True
+    return False
 
 @router.message(F.chat.id.in_(GROUP_IDS), F.text)
 async def detect_and_warn(message: Message):
@@ -2427,6 +2544,58 @@ async def detect_and_warn(message: Message):
         except Exception as e:
             print(f"举报阈值禁言失败: {e}")
 
+    # 外部引用：转发 或 回复了转发消息 → 首次禁言1小时，第二次永封
+    if _has_external_reference(message):
+        display_name = _get_display_name_from_message(message, user_id)
+        try:
+            await message.delete()
+        except Exception:
+            pass
+        try:
+            await bot.send_message(group_id, f"用户 {display_name} 违规引流。")
+        except Exception:
+            pass
+        level_key = (group_id, user_id)
+        level = external_ref_level.get(level_key, 0)
+        try:
+            if level == 0:
+                until_date = int(time.time()) + 3600
+                await bot.restrict_chat_member(
+                    chat_id=group_id,
+                    user_id=user_id,
+                    permissions=ChatPermissions(
+                        can_send_messages=False,
+                        can_send_media_messages=False,
+                        can_send_polls=False,
+                        can_send_other_messages=False,
+                        can_add_web_page_previews=False,
+                        can_change_info=False,
+                        can_invite_users=False,
+                        can_pin_messages=False
+                    ),
+                    until_date=until_date
+                )
+                external_ref_level[level_key] = 1
+            else:
+                await bot.restrict_chat_member(
+                    chat_id=group_id,
+                    user_id=user_id,
+                    permissions=ChatPermissions(
+                        can_send_messages=False,
+                        can_send_media_messages=False,
+                        can_send_polls=False,
+                        can_send_other_messages=False,
+                        can_add_web_page_previews=False,
+                        can_change_info=False,
+                        can_invite_users=False,
+                        can_pin_messages=False
+                    )
+                )
+            await save_link_ref_levels()
+        except Exception as e:
+            print(f"外部引用处罚失败: {e}")
+        return
+
     # 多层内容检测（7 项）
     triggers = []
     bio_exempt = False
@@ -2504,7 +2673,7 @@ async def detect_and_warn(message: Message):
             if (clean_len <= cfg.get("fill_garbage_max_clean_len", 8)) or (space_ratio >= cfg.get("fill_space_ratio", 0.30)):
                 triggers.append("垃圾填充")
     
-    # 5.1 消息链接/@引流即时动作
+    # 5.1 消息链接/@引流即时动作：首次禁言1小时，第二次永封（与外部引用一致）
     if "消息链接/@引流" in triggers:
         display_name = _get_display_name_from_message(message, user_id)
         try:
@@ -2515,8 +2684,10 @@ async def detect_and_warn(message: Message):
             await bot.send_message(group_id, f"用户 {display_name} 违规引流。")
         except Exception:
             pass
-        if triggers == ["消息链接/@引流"]:
-            try:
+        level_key = (group_id, user_id)
+        level = message_link_level.get(level_key, 0)
+        try:
+            if level == 0:
                 until_date = int(time.time()) + 3600
                 await bot.restrict_chat_member(
                     chat_id=group_id,
@@ -2533,29 +2704,27 @@ async def detect_and_warn(message: Message):
                     ),
                     until_date=until_date
                 )
-            except Exception as e:
-                print(f"引流禁言1h失败: {e}")
-            return
-        # 引流 + 其他：直接永久封禁（下面 5.3 会统一做删 24h 等）
-        try:
-            await bot.restrict_chat_member(
-                chat_id=group_id,
-                user_id=user_id,
-                permissions=ChatPermissions(
-                    can_send_messages=False,
-                    can_send_media_messages=False,
-                    can_send_polls=False,
-                    can_send_other_messages=False,
-                    can_add_web_page_previews=False,
-                    can_change_info=False,
-                    can_invite_users=False,
-                    can_pin_messages=False
+                message_link_level[level_key] = 1
+            else:
+                await bot.restrict_chat_member(
+                    chat_id=group_id,
+                    user_id=user_id,
+                    permissions=ChatPermissions(
+                        can_send_messages=False,
+                        can_send_media_messages=False,
+                        can_send_polls=False,
+                        can_send_other_messages=False,
+                        can_add_web_page_previews=False,
+                        can_change_info=False,
+                        can_invite_users=False,
+                        can_pin_messages=False
+                    )
                 )
-            )
+                await _delete_user_recent_and_warnings(group_id, user_id, None, keep_one_text=
+                    f"🚫 用户 {display_name}\n📌 触发原因：{'+'.join(triggers)}\n🔒 处理结果：已被本群永久限制发言。\n{MISJUDGE_BOT_MENTION}")
+            await save_link_ref_levels()
         except Exception as e:
-            print(f"引流+其他永封失败: {e}")
-        await _delete_user_recent_and_warnings(group_id, user_id, None, keep_one_text=
-            f"🚫 用户 {display_name}\n📌 触发原因：{'+'.join(triggers)}\n🔒 处理结果：已被本群永久限制发言。\n{MISJUDGE_BOT_MENTION}")
+            print(f"消息链接处罚失败: {e}")
         return
 
     # 5.2 统一警告（非仅引流时）
@@ -2665,6 +2834,83 @@ async def detect_and_warn(message: Message):
     # 合规消息：仅当 triggers<=1 且本条未受任何处罚时计入
     if len(triggers) <= 1:
         await _try_count_media_and_notify(message, group_id, user_id, cfg)
+
+# 其他内容类型（贴纸/文件/动画等）：仅做外部引用检测，与文本/媒体一致处理
+_OTHER_CONTENT = {
+    ContentType.STICKER,
+    ContentType.DOCUMENT,
+    ContentType.ANIMATION,
+    ContentType.AUDIO,
+    ContentType.LOCATION,
+    ContentType.CONTACT,
+    ContentType.DICE,
+    ContentType.POLL,
+    ContentType.VENUE,
+    ContentType.GAME,
+}
+
+
+@router.message(F.chat.id.in_(GROUP_IDS), F.content_type.in_(_OTHER_CONTENT))
+async def on_other_group_message(message: Message):
+    """贴纸/文件/动画等：转发或回复转发则永久禁言，提示与消息链接一致"""
+    if not message.from_user or message.from_user.is_bot:
+        return
+    cfg = get_group_config(message.chat.id)
+    if not cfg.get("enabled", True):
+        return
+    if not _has_external_reference(message):
+        return
+    user_id = message.from_user.id
+    group_id = message.chat.id
+    display_name = _get_display_name_from_message(message, user_id)
+    try:
+        await message.delete()
+    except Exception:
+        pass
+    try:
+        await bot.send_message(group_id, f"用户 {display_name} 违规引流。")
+    except Exception:
+        pass
+    level_key = (group_id, user_id)
+    level = external_ref_level.get(level_key, 0)
+    try:
+        if level == 0:
+            until_date = int(time.time()) + 3600
+            await bot.restrict_chat_member(
+                chat_id=group_id,
+                user_id=user_id,
+                permissions=ChatPermissions(
+                    can_send_messages=False,
+                    can_send_media_messages=False,
+                    can_send_polls=False,
+                    can_send_other_messages=False,
+                    can_add_web_page_previews=False,
+                    can_change_info=False,
+                    can_invite_users=False,
+                    can_pin_messages=False
+                ),
+                until_date=until_date
+            )
+            external_ref_level[level_key] = 1
+        else:
+            await bot.restrict_chat_member(
+                chat_id=group_id,
+                user_id=user_id,
+                permissions=ChatPermissions(
+                    can_send_messages=False,
+                    can_send_media_messages=False,
+                    can_send_polls=False,
+                    can_send_other_messages=False,
+                    can_add_web_page_previews=False,
+                    can_change_info=False,
+                    can_invite_users=False,
+                    can_pin_messages=False
+                )
+            )
+        await save_link_ref_levels()
+    except Exception as e:
+        print(f"外部引用处罚失败(其他): {e}")
+
 
 @router.callback_query(F.data.startswith("admin_ban:"))
 async def handle_admin_ban(callback: CallbackQuery):
@@ -3133,6 +3379,7 @@ async def main():
     await load_data()
     await load_user_violations()
     load_repeat_levels()
+    load_link_ref_levels()
     await load_media_stats()
     asyncio.create_task(cleanup_deleted_messages())
     asyncio.create_task(broadcast_media_rules_every_2h())
