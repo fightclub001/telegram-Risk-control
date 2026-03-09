@@ -2297,8 +2297,9 @@ def _message_link(chat_id: int, msg_id: int) -> str:
     cid = str(chat_id).replace("-100", "")
     return f"https://t.me/c/{cid}/{msg_id}"
 
-async def _delete_user_recent_and_warnings(group_id: int, user_id: int, orig_msg_id: int | None, keep_one_text: str = ""):
-    """删除该用户最近 24 小时内消息、机器人对其的警告，仅保留一条最终公告（带误封联系）。"""
+async def _delete_user_recent_and_warnings(group_id: int, user_id: int, orig_msg_id: int | None, keep_one_text: str = "", auto_delete_sec: int = 0):
+    """删除该用户最近 24 小时内消息、机器人对其的警告，仅保留一条最终公告（带误封联系）。
+    auto_delete_sec > 0 时，公告消息在指定秒数后自动删除。"""
     key = (group_id, user_id)
     now = time.time()
     cutoff = now - USER_MSG_24H_SEC
@@ -2328,7 +2329,15 @@ async def _delete_user_recent_and_warnings(group_id: int, user_id: int, orig_msg
             pass
     if keep_one_text:
         try:
-            await bot.send_message(group_id, keep_one_text)
+            sent = await bot.send_message(group_id, keep_one_text)
+            if auto_delete_sec > 0:
+                async def _auto_del(cid: int, mid: int):
+                    await asyncio.sleep(auto_delete_sec)
+                    try:
+                        await bot.delete_message(cid, mid)
+                    except Exception:
+                        pass
+                asyncio.create_task(_auto_del(group_id, sent.message_id))
         except Exception:
             pass
 
@@ -2856,7 +2865,8 @@ async def detect_and_warn(message: Message):
             reason = "+".join(triggers)
             display_name = _get_display_name_from_message(message, user_id)
             await _delete_user_recent_and_warnings(group_id, user_id, message.message_id, keep_one_text=
-                f"🚫 用户 {display_name}\n📌 触发原因：{reason}\n🔒 处理结果：已被本群永久限制发言。\n{MISJUDGE_BOT_MENTION}")
+                f"🚫 用户 {display_name}\n📌 触发原因：{reason}\n🔒 处理结果：已被本群永久限制发言。\n{MISJUDGE_BOT_MENTION}",
+                auto_delete_sec=10)
         except Exception as e:
             print(f"自动封禁失败: {e}")
     elif len(triggers) <= 2 and len(triggers) > 0:
