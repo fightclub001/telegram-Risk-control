@@ -2795,8 +2795,8 @@ async def detect_and_warn(message: Message):
         
         if should_warn:
             warning_text = (
-                f"🚨 检测到 👤 用户 {display_name} 疑似违规，包含 {reason} 内容。\n"
-                f"⚠️ 可点举报或由管理员标记误判。"
+                f"🚨 检测到 👤 用户 {display_name} 疑似广告，包含 {reason} 内容。\n"
+                f"⚠️ 警惕该用户，可点举报或由管理员标记。"
             )
             try:
                 kb = build_warning_buttons(group_id, message.message_id, 0)
@@ -3005,10 +3005,9 @@ async def handle_report(callback: CallbackQuery):
         display_name = data.get("suspect_name") or f"ID {user_id}"
         updated_text = (
             "🚨 已收到群成员的举报\n\n"
-            f"👤 用户：{display_name}（ID: {user_id}）\n"
-            f"📌 触发原因：{reason}\n"
+            f"👤 用户：{display_name}（ID: {user_id}）📌 触发原因：{reason}\n"
             f"📣 当前举报人数：{count} 人\n\n"
-            "⚠️ 疑似引流/广告消息，请谨慎，可继续补充举报，由管理员统一处理。"
+            "⚠️ 疑似广告，请勿私信该用户，可继续点举报。"
         )
         kb = build_warning_buttons(group_id, msg_id, count)
         try:
