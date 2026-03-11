@@ -847,7 +847,7 @@ async def edit_bio_keywords(callback: CallbackQuery, state: FSMContext):
         cfg = get_group_config(group_id)
         keywords = cfg.get("bio_keywords", [])
         kw_text = "\n".join(keywords)
-        text = f"<b>{title}</b> › 编辑简介敏感词\n\n{kw_text}\n\n发送新词汇（一行一个）或 /clear 清空"
+        text = f"<b>{title}</b> › 编辑简介敏感词\n\n当前列表：\n" + (kw_text if kw_text else "（空）") + "\n\n发送新词（一行一个）会追加到列表，/clear 清空全部"
         await callback.message.edit_text(text, reply_markup=None)
         await state.update_data(group_id=group_id)
         await state.set_state(AdminStates.EditBioKeywords)
@@ -864,13 +864,20 @@ async def process_bio_keywords(message: Message, state: FSMContext):
         
         if message.text.strip() == "/clear":
             cfg["bio_keywords"] = []
+            await save_config()
+            kb = get_bio_menu_keyboard(group_id)
+            await message.reply("✅ 已清空简介敏感词列表", reply_markup=kb)
         else:
-            cfg["bio_keywords"] = [x.strip().lower() for x in message.text.strip().split("\n") if x.strip()]
-        
-        await save_config()
-        title = await get_chat_title_safe(message.bot, group_id)
-        kb = get_bio_menu_keyboard(group_id)
-        await message.reply(f"✅ 已更新: <b>{title}</b> › 简介敏感词\n共 {len(cfg['bio_keywords'])} 个", reply_markup=kb)
+            existing = cfg.get("bio_keywords", []) or []
+            if not isinstance(existing, list):
+                existing = []
+            new_words = [x.strip().lower() for x in message.text.strip().split("\n") if x.strip()]
+            added = [w for w in new_words if w not in existing]
+            existing.extend(added)
+            cfg["bio_keywords"] = existing
+            await save_config()
+            kb = get_bio_menu_keyboard(group_id)
+            await message.reply(f"✅ 已追加 {len(added)} 个词，当前共 {len(existing)} 个", reply_markup=kb)
         await state.set_state(AdminStates.GroupMenu)
     except Exception as e:
         await message.reply(f"❌ {str(e)}")
@@ -927,7 +934,7 @@ async def edit_display_keywords(callback: CallbackQuery, state: FSMContext):
         cfg = get_group_config(group_id)
         keywords = cfg.get("display_keywords", [])
         kw_text = "\n".join(keywords)
-        text = f"<b>{title}</b> › 编辑名称敏感词\n\n{kw_text}\n\n发送新词汇（一行一个）或 /clear 清空"
+        text = f"<b>{title}</b> › 编辑名称敏感词\n\n当前列表：\n" + (kw_text if kw_text else "（空）") + "\n\n发送新词（一行一个）会追加到列表，/clear 清空全部"
         await callback.message.edit_text(text, reply_markup=None)
         await state.update_data(group_id=group_id)
         await state.set_state(AdminStates.EditDisplayKeywords)
@@ -944,12 +951,20 @@ async def process_display_keywords(message: Message, state: FSMContext):
         
         if message.text.strip() == "/clear":
             cfg["display_keywords"] = []
+            await save_config()
+            kb = get_display_menu_keyboard(group_id)
+            await message.reply("✅ 已清空名称敏感词列表", reply_markup=kb)
         else:
-            cfg["display_keywords"] = [x.strip().lower() for x in message.text.strip().split("\n") if x.strip()]
-        
-        await save_config()
-        kb = get_display_menu_keyboard(group_id)
-        await message.reply(f"✅ 已更新（{len(cfg['display_keywords'])}个）", reply_markup=kb)
+            existing = cfg.get("display_keywords", []) or []
+            if not isinstance(existing, list):
+                existing = []
+            new_words = [x.strip().lower() for x in message.text.strip().split("\n") if x.strip()]
+            added = [w for w in new_words if w not in existing]
+            existing.extend(added)
+            cfg["display_keywords"] = existing
+            await save_config()
+            kb = get_display_menu_keyboard(group_id)
+            await message.reply(f"✅ 已追加 {len(added)} 个词，当前共 {len(existing)} 个", reply_markup=kb)
         await state.set_state(AdminStates.GroupMenu)
     except Exception as e:
         await message.reply(f"❌ {str(e)}")
@@ -1048,7 +1063,7 @@ async def edit_message_keywords(callback: CallbackQuery, state: FSMContext):
         cfg = get_group_config(group_id)
         keywords = cfg.get("message_keywords", [])
         kw_text = "\n".join(keywords)
-        text = f"<b>{title}</b> › 编辑消息敏感词\n\n{kw_text}\n\n发送新词汇（一行一个）或 /clear 清空"
+        text = f"<b>{title}</b> › 编辑消息敏感词\n\n当前列表：\n" + (kw_text if kw_text else "（空）") + "\n\n发送新词（一行一个）会追加到列表，/clear 清空全部"
         await callback.message.edit_text(text, reply_markup=None)
         await state.update_data(group_id=group_id)
         await state.set_state(AdminStates.EditMessageKeywords)
@@ -1065,12 +1080,20 @@ async def process_message_keywords(message: Message, state: FSMContext):
         
         if message.text.strip() == "/clear":
             cfg["message_keywords"] = []
+            await save_config()
+            kb = get_message_menu_keyboard(group_id)
+            await message.reply("✅ 已清空消息敏感词列表", reply_markup=kb)
         else:
-            cfg["message_keywords"] = [x.strip().lower() for x in message.text.strip().split("\n") if x.strip()]
-        
-        await save_config()
-        kb = get_message_menu_keyboard(group_id)
-        await message.reply(f"✅ 已更新（{len(cfg['message_keywords'])}个）", reply_markup=kb)
+            existing = cfg.get("message_keywords", []) or []
+            if not isinstance(existing, list):
+                existing = []
+            new_words = [x.strip().lower() for x in message.text.strip().split("\n") if x.strip()]
+            added = [w for w in new_words if w not in existing]
+            existing.extend(added)
+            cfg["message_keywords"] = existing
+            await save_config()
+            kb = get_message_menu_keyboard(group_id)
+            await message.reply(f"✅ 已追加 {len(added)} 个词，当前共 {len(existing)} 个", reply_markup=kb)
         await state.set_state(AdminStates.GroupMenu)
     except Exception as e:
         await message.reply(f"❌ {str(e)}")
@@ -1376,7 +1399,7 @@ async def edit_repeat_exempt(callback: CallbackQuery, state: FSMContext):
         kw = cfg.get("repeat_exempt_keywords", []) or []
         if not isinstance(kw, list):
             kw = []
-        text = "编辑重复发言豁免词（白名单）\n含任一词的消息不触发重复检测。一行一个：\n\n" + "\n".join(kw) + "\n\n发送新列表或 /clear 清空"
+        text = "编辑重复发言豁免词（白名单）\n含任一词的消息不触发重复检测。\n\n当前列表：\n" + ("\n".join(kw) if kw else "（空）") + "\n\n发送新词（一行一个）会追加到列表，/clear 清空全部"
         await callback.message.edit_text(text, reply_markup=None)
         await state.update_data(group_id=group_id)
         await state.set_state(AdminStates.EditRepeatExemptKeywords)
@@ -1392,10 +1415,18 @@ async def process_repeat_exempt(message: Message, state: FSMContext):
         cfg = get_group_config(group_id)
         if message.text and message.text.strip() == "/clear":
             cfg["repeat_exempt_keywords"] = []
+            await save_config()
+            await message.reply("✅ 已清空豁免词列表", reply_markup=get_repeat_menu_keyboard(group_id))
         else:
-            cfg["repeat_exempt_keywords"] = [x.strip() for x in (message.text or "").strip().splitlines() if x.strip()]
-        await save_config()
-        await message.reply(f"✅ 已更新（{len(cfg['repeat_exempt_keywords'])} 个豁免词）", reply_markup=get_repeat_menu_keyboard(group_id))
+            existing = cfg.get("repeat_exempt_keywords", []) or []
+            if not isinstance(existing, list):
+                existing = []
+            new_words = [x.strip() for x in (message.text or "").strip().splitlines() if x.strip()]
+            added = [w for w in new_words if w not in existing]
+            existing.extend(added)
+            cfg["repeat_exempt_keywords"] = existing
+            await save_config()
+            await message.reply(f"✅ 已追加 {len(added)} 个词，当前共 {len(existing)} 个豁免词", reply_markup=get_repeat_menu_keyboard(group_id))
         await state.set_state(AdminStates.GroupMenu)
     except Exception as e:
         await message.reply(f"❌ {str(e)}")
@@ -1988,7 +2019,7 @@ async def edit_exempt(callback: CallbackQuery, state: FSMContext):
         exempt = cfg.get("exempt_users") or []
         if isinstance(exempt, dict):
             exempt = list(exempt.keys())
-        text = f"编辑豁免检测用户（用户ID，一行一个；豁免简介/昵称等检测，发图另有白名单）\n\n" + "\n".join(str(x) for x in exempt) + "\n\n发送新列表或 /clear 清空"
+        text = f"编辑豁免检测用户（用户ID，一行一个；豁免简介/昵称等检测，发图另有白名单）\n\n当前列表：\n" + ("\n".join(str(x) for x in exempt) if exempt else "（空）") + "\n\n发送新用户ID（一行一个）会追加到列表，/clear 清空全部"
         await callback.message.edit_text(text, reply_markup=None)
         await state.update_data(group_id=group_id)
         await state.set_state(AdminStates.EditExemptUsers)
@@ -2004,10 +2035,18 @@ async def process_exempt(message: Message, state: FSMContext):
         cfg = get_group_config(group_id)
         if message.text.strip() == "/clear":
             cfg["exempt_users"] = []
+            await save_config()
+            await message.reply("✅ 已清空豁免用户列表", reply_markup=get_exempt_menu_keyboard(group_id))
         else:
-            cfg["exempt_users"] = [x.strip() for x in message.text.strip().splitlines() if x.strip()]
-        await save_config()
-        await message.reply(f"✅ 已更新（{len(cfg['exempt_users'])} 人）", reply_markup=get_exempt_menu_keyboard(group_id))
+            existing = cfg.get("exempt_users", []) or []
+            if not isinstance(existing, list):
+                existing = []
+            new_users = [x.strip() for x in message.text.strip().splitlines() if x.strip()]
+            added = [u for u in new_users if u not in existing]
+            existing.extend(added)
+            cfg["exempt_users"] = existing
+            await save_config()
+            await message.reply(f"✅ 已追加 {len(added)} 人，当前共 {len(existing)} 人", reply_markup=get_exempt_menu_keyboard(group_id))
         await state.set_state(AdminStates.GroupMenu)
     except Exception as e:
         await message.reply(f"❌ {str(e)}")
