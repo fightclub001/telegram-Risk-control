@@ -2446,7 +2446,7 @@ async def on_media_message(message: Message):
             group_id,
             f"⚠️ {name} 尚未解锁发媒体。\n"
             f"📊 您的进度：发送合规消息 {count}/{need_msg}，助力 {boosts}/{need_boosts}（满其一即可解锁）。\n"
-            f"输入「权限」查进度。"
+            f"输入「权限」查进度，输入「召唤」使用机器人代发图。"
         )
         last_media_no_perm_msg[sk] = sent.message_id
         if prev_msg_id is None:
